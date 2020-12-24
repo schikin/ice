@@ -3,24 +3,24 @@
 package ice
 
 import (
-	"context"
 	"fmt"
-	"math/rand"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/pion/logging"
-	"github.com/pion/mdns"
 	"github.com/pion/stun"
-	"github.com/pion/transport/packetio"
 	"github.com/pion/transport/vnet"
-	"golang.org/x/net/ipv4"
 )
 
 const (
+	// defaultPacing is the pacing limiter that will be used for STUN transactions
+	defaultPacing = 50 // 50 ms as per https://tools.ietf.org/html/draft-ietf-ice-rfc5245bis-20#section-14
+
+	// minPacing is the minimum allowed ICE pacing
+	minPacing = 50
+
 	// taskLoopInterval is the interval at which the agent performs checks
 	defaultTaskLoopInterval = 2 * time.Second
 
@@ -51,8 +51,19 @@ const (
 	// the number of bytes that can be buffered before we start to error
 	maxBufferSize = 1000 * 1000 // 1MB
 
+	// gathering timeout
+	gatherTimeout = 5 * time.Second
+
 	// the number of outbound binding requests we cache
+	// avoid using this for now - it's not required but recommended. not using this can improve performance
 	maxPendingBindingRequests = 50
+
+	// by default assume half-trickle for backwards compatibility
+	defaultTrickleMode = TrickleModeHalf
+
+	defaultStandard = ICEStandardRFC8445
+	
+	stunGatherTimeout = 5 * time.Second
 )
 
 var (
@@ -65,1095 +76,853 @@ type bindingRequest struct {
 	isUseCandidate bool
 }
 
+type Credentials struct {
+	UFrag string
+	Pwd string
+}
+
+type LocalSessionRequest struct {
+	Streams []LocalStreamRequest
+}
+
+type RemoteSessionRequest struct {
+	Options            SessionParameters
+	SessionCredentials *Credentials
+	Streams            []RemoteStreamRequest
+}
+
+//compatible with WebRTC states
+type ConnectionState int
+
+const (
+	// ConnectionStateNew The ICE agent is gathering addresses or is waiting to be given remote candidates through calls to RTCPeerConnection.addIceCandidate() (or both).
+	ConnectionStateNew ConnectionState = iota + 1
+
+	// ConnectionStateChecking The ICE agent has been given one or more remote candidates and is checking pairs of local and remote candidates against one another to try to find a compatible match, but has not yet found a pair which will allow the peer connection to be made. It's possible that gathering of candidates is also still underway.
+	ConnectionStateChecking
+
+	// ConnectionStateConnected A usable pairing of local and remote candidates has been found for all Components of the connection, and the connection has been established. It's possible that gathering is still underway, and it's also possible that the ICE agent is still checking candidates against one another looking for a better connection to use.
+	ConnectionStateConnected
+
+	// ConnectionStateCompleted The ICE agent has finished gathering candidates, has checked all pairs against one another, and has found a connection for all Components.
+	ConnectionStateCompleted
+
+	// ConnectionStateFailed The ICE candidate has checked all candidates pairs against one another and has failed to find compatible matches for all Components of the connection. It is, however, possible that the ICE agent did find compatible connections for some Components.
+	ConnectionStateFailed
+
+	// ConnectionStateDisconnected Checks to ensure that Components are still connected failed for at least one component of the RTCPeerConnection. This is a less stringent test than "failed" and may trigger intermittently and resolve just as spontaneously on less reliable networks, or during temporary disconnections. When the problem resolves, the connection may return to the "connected" state.
+	ConnectionStateDisconnected
+
+	// ConnectionStateClosed The ICE agent for this RTCPeerConnection has shut down and is no longer handling requests.
+	ConnectionStateClosed
+)
+
+/*
+		https://tools.ietf.org/html/rfc5245#section-15.4
+
+		The "ice-pwd" and "ice-ufrag" attributes can appear at either the
+	   	session-level or media-level.  When present in both, the value in the
+	   	media-level takes precedence.  Thus, the value at the session-level
+	   	is effectively a default that applies to all media streams, unless
+	   	overridden by a media-level value.  Whether present at the session or
+	   	media-level, there MUST be an ice-pwd and ice-ufrag attribute for
+	   	each media stream.  If two media streams have identical ice-ufrag's,
+	   	they MUST have identical ice-pwd's.
+*/
+
+type LocalStreamRequest struct {
+	ID	string
+
+	StreamCredentials *Credentials //you can choose to have per-stream credentials too
+	TrickleMode *TrickleMode //trickle mode can be set at media-level as well as session-level
+	Components	[]LocalComponentRequest
+}
+
+type RemoteStreamRequest struct {
+	ID	string
+
+	EndOfCandidates bool
+	Trickle bool
+	StreamCredentials *Credentials
+	Components	[]RemoteComponentRequest
+}
+
+type RemoteComponentRequest struct {
+	ID	uint16
+	Candidates		[]Candidate
+	RelatedComponent *RemoteComponentRequest
+}
+
+type LocalComponentRequest struct {
+	ID	uint16
+	RelatedComponent *LocalComponentRequest //hack for the case of RTP/RTCP mux disabled
+}
+
+type SessionProposal struct {
+	NegotiateParams SessionParameters
+	Streams          map[string]*StreamProposal //candidates by stream. to find out component id you can use field of candidate
+}
+
+type StreamProposal struct {
+	ID string
+	Candidates []Candidate
+	Trickle bool
+}
+
+type restartPacerEvent struct {
+}
+
+type updatePeerStandard struct {
+	Standard ICEStandard
+}
+
+type deleteStreamEvent struct {
+	Stream *Stream
+}
+
+type remoteCandidateEvent struct {
+	Component *Component
+	Candidate *Candidate
+}
+
+func (a *Agent) eventLoop() {
+	for {
+		select {
+		case signalEvt := <- a.signalChannel.Events():
+			a.processRemoteSignal(signalEvt)
+		case evt := <- a.events:
+			switch typedEvt := evt.(type) {
+			case poisonPill:
+				a.log.Infof("poison pill received - stopping event loop")
+				return
+			case gathererCandidateEvent:
+				typedEvt.Gatherer.Component.processLocalCandidate(typedEvt.Candidate)
+				break
+			case gathererStateEvent:
+				typedEvt.Gatherer.Component.processGatherState(typedEvt.State)
+				break
+			}
+		}
+	}
+}
+
+func (a *Agent) processGatherState(component *Component, state GatheringState) {
+	hasError := false
+	hasUnfinished := false
+
+outerLoop:
+	for _, c := range a.Streams {
+		switch c.gatheringState {
+		case GatheringStateNew, GatheringStateGathering:
+			hasUnfinished = true
+			break outerLoop
+		case GatheringStateFailed:
+			hasError = true
+			break
+		}
+	}
+
+	if !hasUnfinished {
+		if !hasError {
+			a.setGatheringState(GatheringStateComplete)
+		} else {
+			a.setGatheringState(GatheringStateFailed)
+		}
+	} else {
+		a.setGatheringState(GatheringStateGathering)
+	}
+}
+
+func (a *Agent) start() {
+	a.mux.Lock()
+	defer a.mux.Unlock()
+
+	a.isStarted = true
+
+	a.stunPacer.start()
+	go a.eventLoop()
+}
+
+func (a *Agent) close() {
+	a.mux.Lock()
+	defer a.mux.Unlock()
+
+	for _, stream := range a.Streams {
+		stream.close()
+	}
+
+	a.isStarted = false
+	a.events <- poisonPill{}
+	a.stunPacer.close()
+}
+
+func (a *Agent) flushRemoteQueue() {
+candLoop:
+	for {
+		select {
+		case candSig := <- a.remoteSignalQueue.candidate:
+			stream, ok := a.Streams[candSig.StreamId]
+
+			if !ok {
+				a.log.Infof("unknown streamId=%s for enqueued candidate", candSig.StreamId)
+				continue
+			}
+
+			stream.processRemoteCandidate(&candSig.Candidate)
+			break
+		default:
+			a.log.Debugf("remote candidate queue flushed")
+			break candLoop
+		}
+	}
+
+eocLoop:
+	for {
+		select {
+		case eocSig := <- a.remoteSignalQueue.eoc:
+			stream, ok := a.Streams[eocSig.StreamId]
+
+			if !ok {
+				a.log.Infof("unknown streamId=%s for enqueued eoc", eocSig.StreamId)
+				continue
+			}
+
+			stream.processRemoteEndOfCandidates()
+			break
+		default:
+			a.log.Debugf("remote eoc queue flushed")
+			break eocLoop
+		}
+	}
+}
+
+func (a *Agent) processRemoteSignal(signalEvt interface{}) {
+	a.mux.Lock()
+	defer a.mux.Unlock()
+
+	state := a.localTrickleState
+
+	if state == TrickleStateFinished {
+		a.log.Debugf("received remote signal after trickling is finished - ignoring")
+		return
+	}
+
+	trickling := state == TrickleStateTrickling
+
+	switch typedSignal := signalEvt.(type) {
+	case SignalOffer:
+		a.remoteSignalQueue.offer <- &typedSignal
+		break
+	case SignalCandidate:
+		if trickling {
+			stream, ok := a.Streams[typedSignal.StreamId]
+
+			if !ok {
+				a.log.Infof("received candidate for unknown streamId=%s - ignoring", typedSignal.StreamId)
+			}
+
+			stream.processRemoteCandidate(&typedSignal.Candidate)
+		} else {
+			a.remoteSignalQueue.candidate <- &typedSignal
+		}
+
+		break
+	case SignalEndOfCandidates:
+		if trickling {
+			stream, ok := a.Streams[typedSignal.StreamId]
+
+			if !ok {
+				a.log.Infof("received EOC for unknown streamId=%s - ignoring", typedSignal.StreamId)
+			}
+
+			stream.processRemoteEndOfCandidates()
+		} else {
+			a.remoteSignalQueue.eoc <- &typedSignal
+		}
+	}
+}
+
+func (a *Agent) processLocalCandidate(stream *Stream, candidate *LocalCandidate) {
+	a.mux.Lock()
+	defer a.mux.Unlock()
+
+	currState := a.localTrickleState
+
+	sig := SignalCandidate{
+		Candidate: candidate.Candidate,
+		StreamId:  stream.ID,
+	}
+
+	if currState == TrickleStateTrickling {
+		//TODO: create additional event loop for side effect serialization - otherwise EOC might be emitted before all candidates are conveyed which is against standard
+		go a.signalChannel.SendCandidate(sig)
+	} else if currState == TrickleStateFinished {
+		a.log.Debugf("received local candidate: %s after trickling is finished - ignoring", candidate.Candidate)
+	} else {
+		a.localSignalQueue.candidate <- &sig
+	}
+}
+
+func (a *Agent) setGatheringState(state GatheringState) {
+	a.mux.Lock()
+	currState := a.localGatherState
+	a.localGatherState = state
+	a.mux.Unlock()
+
+	if a.onGatherStateCallback != nil && currState != state {
+		//side effect - run in goroutine
+		go (*a.onGatherStateCallback)(state)
+	}
+}
+
+func (a *Agent) setConnectionState(state ConnectionState) {
+	a.mux.Lock()
+	currState := a.connectionState
+	a.connectionState = state
+	a.mux.Unlock()
+
+	if a.onConnectionStateCallback != nil && currState != state {
+		//side effect - run in goroutine
+		go (*a.onConnectionStateCallback)(state)
+	}
+}
+
+func (a *Agent) onPacing() {
+	a.mux.Lock()
+
+	localTrickleState := a.localTrickleState
+	remoteTrickleState := a.remoteTrickleState
+	connState := a.connectionState
+
+	a.mux.Unlock()
+
+	connecting := connState == ConnectionStateChecking || connState == ConnectionStateConnected
+
+	/*
+		inside connectivity logic immediate STUN transactions will be generated
+		this may lead to double-pacing (sending STUN transactions at double pacing rate)
+		this is an incosistency within the trickle standard itself - it says that RFC5245 pacing needs to be followed
+		but on the other hand it says that RFC5245 logic for connectivity checks should be followed. this is contradictory:
+		in trickle both gathering transactions and connectivity transactions can occur at the same time
+		if we try to strictly follow the pacing requirements - it kills the idea behind trickle of reducing the connection setup time -
+		if we want to stick with strict queueing and execution of transactions then connectivity checks will never start
+		before the gathering transactions are dispatched as gathering transactions are enqueued before the connectivity checks
+		this would render ICE TRICKLE to always work in a mode similar to TRICKLE-NONE (checks only start after all candidates have been gathered)
+
+		also, global 5ms pacing restriction is not followed here as rationale for 5ms pacing doesn't really apply to us:
+		link to pacing rationale: https://tools.ietf.org/html/rfc8445#appendix-B.1
+
+		1. 	we are building for server-side first and most of the time our interfaces will be facing WAN directly (without NAT)
+			so the technical NAT binding time doesn't apply (as most of the times there will be no NAT for us
+		2.  5ms restriction is relevant for all transactions (both gathering and connectivity checks) so given we have 500 clients
+			per instance (which is more than a reasonable amount) that would limit the amount of connectivity checks we can issue
+			to 2 per client per second. that would make performing connectivity checks on such instance impossible
+
+
+		!thus, we relax the pacing restriction here in order to reduce the connection time
+
+	 */
+	if connecting {
+		/* https://tools.ietf.org/html/draft-ietf-ice-trickle-21#section-8
+
+		   As specified in [rfc5245bis], whenever timer Ta fires, only check
+		   lists in the Running state will be picked when scheduling
+		   connectivity checks for candidate pairs.  Therefore, a Trickle ICE
+		   agent MUST keep each check list in the Running state as long as it
+		   expects candidate pairs to be incrementally added to the check list.
+		   After that, the check list state is set according to the procedures
+		   in [rfc5245bis].
+
+		 */
+
+		if localTrickleState == TrickleStateFinished && remoteTrickleState == TrickleStateFinished {
+			a.rfc8445ConnectivityLogic()
+		} else {
+			a.trickleConnectivityLogic()
+		}
+	}
+}
+
+func (a *Agent) rfc8445ConnectivityLogic() {
+
+}
+
+func (a *Agent) trickleConnectivityLogic() {
+	n := len(a.Streams)
+
+	for i := 0; i <= n; i++ {
+		idx := a.streamsLoopCounter
+
+		a.streamsLoopCounter = ( a.streamsLoopCounter + 1 ) % n
+
+		stream := a.streamsOrdered[idx]
+
+		triggeredPair := stream.checklist.popTriggeredQueue()
+
+		if triggeredPair != nil {
+			triggeredPair.startCheck()
+			return
+		}
+
+		var waitList []*CandidatePair
+		var frozenList []*CandidatePair
+
+		for _, pair := range stream.checklist.all {
+			if pair.getState() == CandidatePairStateFrozen {
+				frozenList = append(frozenList, pair)
+			} else if pair.getState() == CandidatePairStateWaiting {
+				waitList = append(waitList, pair)
+			}
+		}
+
+		/*
+				3.  If there are one or more candidate pairs in the Waiting state,
+		       	the agent picks the highest-priority candidate pair (if there are
+		       	multiple pairs with the same priority, the pair with the lowest
+		       	component ID is picked) in the Waiting state, performs a
+		       	connectivity check on that pair, puts the candidate pair state to
+		       	In-Progress, and aborts the subsequent steps.
+		 */
+
+		if len(waitList) > 0 {
+			var maxPriority uint64
+			var minComponentId uint16
+			var selectedPair *CandidatePair
+
+			for _, pair := range waitList {
+				if pair.priority > maxPriority {
+					selectedPair = pair
+					maxPriority = pair.priority
+					minComponentId = pair.local.ComponentId
+				} else if pair.priority == maxPriority && pair.local.ComponentId < minComponentId {
+					selectedPair = pair
+					maxPriority = pair.priority
+					minComponentId = pair.local.ComponentId
+				}
+			}
+
+			if selectedPair == nil {
+				a.log.Errorf("something impossible has happened")
+				return
+			}
+
+			selectedPair.startCheck()
+			return
+		}
+
+		/*
+			   2.  If there is no candidate pair in the Waiting state, and if there
+		       are one or more pairs in the Frozen state, the agent checks the
+		       foundation associated with each pair in the Frozen state.  For a
+		       given foundation, if there is no pair (in any checklist in the
+		       checklist set) in the Waiting or In-Progress state, the agent
+		       puts the candidate pair state to Waiting and continues with the
+		       next step.
+		 */
+
+		if len(frozenList) > 0 {
+			for _, pair := range frozenList {
+				list := a.pairFoundationIdx[pair.foundation]
+
+				if list == nil {
+					a.log.Errorf("something went terribly wrong - pair foundation wasn't indexed")
+					pair.startCheck()
+					return
+				}
+
+				isFoundationRunning := false
+
+				for _, otherPair := range list {
+					if otherPair.getState() == CandidatePairStateInProgress || otherPair.getState() == CandidatePairStateWaiting {
+						isFoundationRunning = true
+						break
+					}
+				}
+
+				if !isFoundationRunning {
+					pair.startCheck()
+					return
+				}
+			}
+		}
+	}
+}
+
 // Agent represents the ICE agent
 type Agent struct {
-	onConnectionStateChangeHdlr       func(ConnectionState)
-	onSelectedCandidatePairChangeHdlr func(Candidate, Candidate)
-	onCandidateHdlr                   func(Candidate)
+	Config  			AgentConfig
 
-	// Used to block double Dial/Accept
-	opened bool
+	Streams 			map[string]*Stream
+	streamsOrdered		map[int]*Stream
+	//to control ordered execution of checks
+	streamsLoopCounter 	int
 
-	// State owned by the taskLoop
-	taskChan        chan task
-	onConnected     chan struct{}
-	onConnectedOnce sync.Once
+	tieBreaker      	uint64
+	connectionState 	ConnectionState
 
-	connectivityTicker *time.Ticker
-	// force candidate to be contacted immediately (instead of waiting for connectivityTicker)
-	forceCandidateContact chan bool
+	mDNS				*MulticastDNSHelper
 
-	trickle         bool
-	tieBreaker      uint64
-	connectionState ConnectionState
-	gatheringState  GatheringState
+	isControlling 		bool
+	isStarted			bool
 
-	mDNSMode MulticastDNSMode
-	mDNSName string
-	mDNSConn *mdns.Conn
+	pairFoundationIdx	map[string][]*CandidatePair
 
-	haveStarted   atomic.Value
-	isControlling bool
+	localCredentials 	Credentials
+	remoteCredentials 	*Credentials
 
-	maxBindingRequests uint16
+	localStandard  		ICEStandard
+	remoteStandard 		ICEStandard
 
-	candidateSelectionTimeout time.Duration
-	hostAcceptanceMinWait     time.Duration
-	srflxAcceptanceMinWait    time.Duration
-	prflxAcceptanceMinWait    time.Duration
-	relayAcceptanceMinWait    time.Duration
+	networkTypes 		[]NetworkType
 
-	portmin uint16
-	portmax uint16
+	defaultTrickleMode 	TrickleMode
 
-	candidateTypes []CandidateType
+	loggerFactory 		logging.LoggerFactory
+	log           		logging.LeveledLogger
 
-	// How long should a pair stay quiet before we declare it dead?
-	// 0 means never timeout
-	connectionTimeout time.Duration
+	stunPacer			*stunPacer
+	stunConfig 	  		STUNConfig
+	turnConfig	  		TURNConfig
 
-	// How often should we send keepalive packets?
-	// 0 means never
-	keepaliveInterval time.Duration
+	localGatherState 	GatheringState
+	remoteGatherState 	GatheringState
 
-	// How after should we run our internal taskLoop
-	taskLoopInterval time.Duration
+	signalChannel		SignalChannel
 
-	localUfrag      string
-	localPwd        string
-	localCandidates map[NetworkType][]Candidate
+	//before the initial proposal is generated
+	localTrickleState 	TrickleState
+	remoteTrickleState	TrickleState
 
-	remoteUfrag      string
-	remotePwd        string
-	remoteCandidates map[NetworkType][]Candidate
+	foundationGenerator *foundationGenerator
 
-	checklist []*candidatePair
-	selector  pairCandidateSelector
+	events	  			EventChannel
 
-	selectedPairMutex sync.RWMutex
-	selectedPair      *candidatePair
+	localSignalQueue			*signalQueue
+	remoteSignalQueue			*signalQueue
 
-	urls         []*URL
-	networkTypes []NetworkType
+	onGatherStateCallback 		*func(state GatheringState)
+	onCandidateCallback 		*func(candidate Candidate)
+	onConnectionStateCallback 	*func(state ConnectionState)
 
-	buffer *packetio.Buffer
+	//used to report results in dial/accept procedures
+	connResultChannel	chan interface{}
 
-	// LRU of outbound Binding request Transaction IDs
-	pendingBindingRequests []bindingRequest
-
-	// State for closing
-	done chan struct{}
-	err  atomicError
-
-	loggerFactory logging.LoggerFactory
-	log           logging.LeveledLogger
-
-	net *vnet.Net
+	mux					sync.Mutex
+	net 				*vnet.Net
 }
 
-func (a *Agent) ok() error {
-	select {
-	case <-a.done:
-		return a.getErr()
-	default:
+func (a *Agent) processPair(pair *CandidatePair) {
+	a.mux.Lock()
+	defer a.mux.Unlock()
+
+	foundation := pair.foundation
+	list, ok := a.pairFoundationIdx[foundation]
+
+	if !ok {
+		list = []*CandidatePair{}
 	}
-	return nil
+
+	a.pairFoundationIdx[foundation] = append(list, pair)
 }
 
-func (a *Agent) getErr() error {
-	err := a.err.Load()
-	if err != nil {
-		return err
-	}
-	return ErrClosed
+func (a* Agent) dispatchEvent(evt Event) {
+	a.events <- evt
 }
 
-// AgentConfig collects the arguments to ice.Agent construction into
-// a single structure, for future-proofness of the interface
-type AgentConfig struct {
-	Urls []*URL
+/* https://tools.ietf.org/html/rfc8445#section-7.3.1.1
 
-	// PortMin and PortMax are optional. Leave them 0 for the default UDP port allocation strategy.
-	PortMin uint16
-	PortMax uint16
+   resolves role conflict and returns the stun message
+*/
+func (a* Agent) resolveRoleConflict(remoteControlAttribute AttrControl) (bool, stun.Setter) {
+	a.mux.Lock()
+	defer a.mux.Unlock()
 
-	// Trickle specifies whether or not ice agent should trickle candidates or
-	// work perform synchronous gathering.
-	Trickle bool
+	remoteTieBreaker := remoteControlAttribute.Tiebreaker
 
-	// MulticastDNSMode controls mDNS behavior for the ICE agent
-	MulticastDNSMode MulticastDNSMode
-
-	// ConnectionTimeout defaults to 30 seconds when this property is nil.
-	// If the duration is 0, we will never timeout this connection.
-	ConnectionTimeout *time.Duration
-	// KeepaliveInterval determines how often should we send ICE
-	// keepalives (should be less then connectiontimeout above)
-	// when this is nil, it defaults to 10 seconds.
-	// A keepalive interval of 0 means we never send keepalive packets
-	KeepaliveInterval *time.Duration
-
-	// NetworkTypes is an optional configuration for disabling or enabling
-	// support for specific network types.
-	NetworkTypes []NetworkType
-
-	// CandidateTypes is an optional configuration for disabling or enabling
-	// support for specific candidate types.
-	CandidateTypes []CandidateType
-
-	LoggerFactory logging.LoggerFactory
-
-	// taskLoopInterval controls how often our internal task loop runs, this
-	// task loop handles things like sending keepAlives. This is only value for testing
-	// keepAlive behavior should be modified with KeepaliveInterval and ConnectionTimeout
-	taskLoopInterval time.Duration
-
-	// MaxBindingRequests is the max amount of binding requests the agent will send
-	// over a candidate pair for validation or nomination, if after MaxBindingRequests
-	// the candidate is yet to answer a binding request or a nomination we set the pair as failed
-	MaxBindingRequests *uint16
-
-	// CandidatesSelectionTimeout specify a timeout for selecting candidates, if no nomination has happen
-	// before this timeout, once hit we will nominate the best valid candidate available,
-	// or mark the connection as failed if no valid candidate is available
-	CandidateSelectionTimeout *time.Duration
-
-	// HostAcceptanceMinWait specify a minimum wait time before selecting host candidates
-	HostAcceptanceMinWait *time.Duration
-	// HostAcceptanceMinWait specify a minimum wait time before selecting srflx candidates
-	SrflxAcceptanceMinWait *time.Duration
-	// HostAcceptanceMinWait specify a minimum wait time before selecting prflx candidates
-	PrflxAcceptanceMinWait *time.Duration
-	// HostAcceptanceMinWait specify a minimum wait time before selecting relay candidates
-	RelayAcceptanceMinWait *time.Duration
-
-	// Net is the our abstracted network interface for internal development purpose only
-	// (see github.com/pion/transport/vnet)
-	Net *vnet.Net
-}
-
-// NewAgent creates a new Agent
-func NewAgent(config *AgentConfig) (*Agent, error) {
-	if config.PortMax < config.PortMin {
-		return nil, ErrPort
-	}
-
-	mDNSName, err := generateMulticastDNSName()
-	if err != nil {
-		return nil, err
-	}
-
-	mDNSMode := config.MulticastDNSMode
-	if mDNSMode == 0 {
-		mDNSMode = MulticastDNSModeQueryOnly
-	}
-
-	loggerFactory := config.LoggerFactory
-	if loggerFactory == nil {
-		loggerFactory = logging.NewDefaultLoggerFactory()
-	}
-	log := loggerFactory.NewLogger("ice")
-
-	var mDNSConn *mdns.Conn
-	mDNSConn, err = func() (*mdns.Conn, error) {
-		if mDNSMode == MulticastDNSModeDisabled {
-			return nil, nil
-		}
-
-		addr, mdnsErr := net.ResolveUDPAddr("udp4", mdns.DefaultAddress)
-		if mdnsErr != nil {
-			return nil, mdnsErr
-		}
-
-		l, mdnsErr := net.ListenUDP("udp4", addr)
-		if mdnsErr != nil {
-			// If ICE fails to start MulticastDNS server just warn the user and continue
-			log.Errorf("Failed to enable mDNS, continuing in mDNS disabled mode: (%s)", mdnsErr)
-			mDNSMode = MulticastDNSModeDisabled
-			return nil, nil
-		}
-
-		switch mDNSMode {
-		case MulticastDNSModeQueryOnly:
-			return mdns.Server(ipv4.NewPacketConn(l), &mdns.Config{})
-		case MulticastDNSModeQueryAndGather:
-			return mdns.Server(ipv4.NewPacketConn(l), &mdns.Config{
-				LocalNames: []string{mDNSName},
-			})
-		default:
-			return nil, nil
-		}
-	}()
-	if err != nil {
-		return nil, err
-	}
-
-	a := &Agent{
-		tieBreaker:             rand.New(rand.NewSource(time.Now().UnixNano())).Uint64(),
-		gatheringState:         GatheringStateNew,
-		connectionState:        ConnectionStateNew,
-		localCandidates:        make(map[NetworkType][]Candidate),
-		remoteCandidates:       make(map[NetworkType][]Candidate),
-		pendingBindingRequests: make([]bindingRequest, 0, maxPendingBindingRequests),
-		checklist:              make([]*candidatePair, 0),
-		urls:                   config.Urls,
-		networkTypes:           config.NetworkTypes,
-
-		localUfrag:    randSeq(16),
-		localPwd:      randSeq(32),
-		taskChan:      make(chan task),
-		onConnected:   make(chan struct{}),
-		buffer:        packetio.NewBuffer(),
-		done:          make(chan struct{}),
-		portmin:       config.PortMin,
-		portmax:       config.PortMax,
-		trickle:       config.Trickle,
-		loggerFactory: loggerFactory,
-		log:           log,
-		net:           config.Net,
-
-		mDNSMode: mDNSMode,
-		mDNSName: mDNSName,
-		mDNSConn: mDNSConn,
-
-		forceCandidateContact: make(chan bool, 1),
-	}
-	a.haveStarted.Store(false)
-
-	if a.net == nil {
-		a.net = vnet.NewNet(nil)
-	} else {
-		a.log.Warn("vnet is enabled")
-		if a.mDNSMode != MulticastDNSModeDisabled {
-			a.log.Warn("vnet does not support mDNS yet")
-		}
-	}
-
-	if config.MaxBindingRequests == nil {
-		a.maxBindingRequests = defaultMaxBindingRequests
-	} else {
-		a.maxBindingRequests = *config.MaxBindingRequests
-	}
-
-	if config.CandidateSelectionTimeout == nil {
-		a.candidateSelectionTimeout = defaultCandidateSelectionTimeout
-	} else {
-		a.candidateSelectionTimeout = *config.CandidateSelectionTimeout
-	}
-
-	if config.HostAcceptanceMinWait == nil {
-		a.hostAcceptanceMinWait = defaultHostAcceptanceMinWait
-	} else {
-		a.hostAcceptanceMinWait = *config.HostAcceptanceMinWait
-	}
-
-	if config.SrflxAcceptanceMinWait == nil {
-		a.srflxAcceptanceMinWait = defaultSrflxAcceptanceMinWait
-	} else {
-		a.srflxAcceptanceMinWait = *config.SrflxAcceptanceMinWait
-	}
-
-	if config.PrflxAcceptanceMinWait == nil {
-		a.prflxAcceptanceMinWait = defaultPrflxAcceptanceMinWait
-	} else {
-		a.prflxAcceptanceMinWait = *config.PrflxAcceptanceMinWait
-	}
-
-	if config.RelayAcceptanceMinWait == nil {
-		a.relayAcceptanceMinWait = defaultRelayAcceptanceMinWait
-	} else {
-		a.relayAcceptanceMinWait = *config.RelayAcceptanceMinWait
-	}
-
-	// Make sure the buffer doesn't grow indefinitely.
-	// NOTE: We actually won't get anywhere close to this limit.
-	// SRTP will constantly read from the endpoint and drop packets if it's full.
-	a.buffer.SetLimitSize(maxBufferSize)
-
-	// connectionTimeout used to declare a connection dead
-	if config.ConnectionTimeout == nil {
-		a.connectionTimeout = defaultConnectionTimeout
-	} else {
-		a.connectionTimeout = *config.ConnectionTimeout
-	}
-
-	if config.KeepaliveInterval == nil {
-		a.keepaliveInterval = defaultKeepaliveInterval
-	} else {
-		a.keepaliveInterval = *config.KeepaliveInterval
-	}
-
-	if config.taskLoopInterval == 0 {
-		a.taskLoopInterval = defaultTaskLoopInterval
-	} else {
-		a.taskLoopInterval = config.taskLoopInterval
-	}
-
-	if config.CandidateTypes == nil || len(config.CandidateTypes) == 0 {
-		a.candidateTypes = defaultCandidateTypes
-	} else {
-		a.candidateTypes = config.CandidateTypes
-	}
-
-	go a.taskLoop()
-
-	// Initialize local candidates
-	if !a.trickle {
-		a.gatherCandidates()
-	}
-	return a, nil
-}
-
-// OnConnectionStateChange sets a handler that is fired when the connection state changes
-func (a *Agent) OnConnectionStateChange(f func(ConnectionState)) error {
-	return a.run(func(agent *Agent) {
-		agent.onConnectionStateChangeHdlr = f
-	})
-}
-
-// OnSelectedCandidatePairChange sets a handler that is fired when the final candidate
-// pair is selected
-func (a *Agent) OnSelectedCandidatePairChange(f func(Candidate, Candidate)) error {
-	return a.run(func(agent *Agent) {
-		agent.onSelectedCandidatePairChangeHdlr = f
-	})
-}
-
-// OnCandidate sets a handler that is fired when new candidates gathered. When
-// the gathering process complete the last candidate is nil.
-func (a *Agent) OnCandidate(f func(Candidate)) error {
-	return a.run(func(agent *Agent) {
-		agent.onCandidateHdlr = f
-	})
-}
-
-func (a *Agent) onSelectedCandidatePairChange(p *candidatePair) {
-	if p != nil {
-		if a.onSelectedCandidatePairChangeHdlr != nil {
-			a.onSelectedCandidatePairChangeHdlr(p.local, p.remote)
-		}
-	}
-}
-
-func (a *Agent) startConnectivityChecks(isControlling bool, remoteUfrag, remotePwd string) error {
-	switch {
-	case a.haveStarted.Load():
-		return ErrMultipleStart
-	case remoteUfrag == "":
-		return ErrRemoteUfragEmpty
-	case remotePwd == "":
-		return ErrRemotePwdEmpty
-	}
-
-	a.haveStarted.Store(true)
-	a.log.Debugf("Started agent: isControlling? %t, remoteUfrag: %q, remotePwd: %q", isControlling, remoteUfrag, remotePwd)
-
-	return a.run(func(agent *Agent) {
-		agent.isControlling = isControlling
-		agent.remoteUfrag = remoteUfrag
-		agent.remotePwd = remotePwd
-
-		if isControlling {
-			a.selector = &controllingSelector{agent: a, log: a.log}
-		} else {
-			a.selector = &controlledSelector{agent: a, log: a.log}
-		}
-
-		a.selector.Start()
-
-		agent.updateConnectionState(ConnectionStateChecking)
-
-		// TODO this should be dynamic, and grow when the connection is stable
-		a.requestConnectivityCheck()
-		agent.connectivityTicker = time.NewTicker(a.taskLoopInterval)
-	})
-}
-
-func (a *Agent) updateConnectionState(newState ConnectionState) {
-	if a.connectionState != newState {
-		a.log.Infof("Setting new connection state: %s", newState)
-		a.connectionState = newState
-		hdlr := a.onConnectionStateChangeHdlr
-		if hdlr != nil {
-			// Call handler async since we may be holding the agent lock
-			// and the handler may also require it
-			go hdlr(newState)
-		}
-	}
-}
-
-func (a *Agent) setSelectedPair(p *candidatePair) {
-	a.log.Tracef("Set selected candidate pair: %s", p)
-	// Notify when the selected pair changes
-	a.onSelectedCandidatePairChange(p)
-
-	a.selectedPairMutex.Lock()
-	a.selectedPair = p
-	a.selectedPair.nominated = true
-	a.selectedPairMutex.Unlock()
-	a.updateConnectionState(ConnectionStateConnected)
-
-	// Close mDNS Conn. We don't need to do anymore querying
-	// and no reason to respond to others traffic
-	a.closeMulticastConn()
-
-	// Signal connected
-	a.onConnectedOnce.Do(func() { close(a.onConnected) })
-}
-
-func (a *Agent) pingAllCandidates() {
-	for _, p := range a.checklist {
-
-		if p.state == CandidatePairStateWaiting {
-			p.state = CandidatePairStateInProgress
-		} else if p.state != CandidatePairStateInProgress {
-			continue
-		}
-
-		if p.bindingRequestCount > a.maxBindingRequests {
-			a.log.Tracef("max requests reached for pair %s, marking it as failed\n", p)
-			p.state = CandidatePairStateFailed
-		} else {
-			a.selector.PingCandidate(p.local, p.remote)
-			p.bindingRequestCount++
-		}
-	}
-}
-
-func (a *Agent) getBestAvailableCandidatePair() *candidatePair {
-	var best *candidatePair
-	for _, p := range a.checklist {
-		if p.state == CandidatePairStateFailed {
-			continue
-		}
-
-		if best == nil {
-			best = p
-		} else if best.Priority() < p.Priority() {
-			best = p
-		}
-	}
-	return best
-}
-
-func (a *Agent) getBestValidCandidatePair() *candidatePair {
-	var best *candidatePair
-	for _, p := range a.checklist {
-		if p.state != CandidatePairStateSucceeded {
-			continue
-		}
-
-		if best == nil {
-			best = p
-		} else if best.Priority() < p.Priority() {
-			best = p
-		}
-	}
-	return best
-}
-
-func (a *Agent) addPair(local, remote Candidate) *candidatePair {
-	p := newCandidatePair(local, remote, a.isControlling)
-	a.checklist = append(a.checklist, p)
-	return p
-}
-
-func (a *Agent) findPair(local, remote Candidate) *candidatePair {
-	for _, p := range a.checklist {
-		if p.local.Equal(local) && p.remote.Equal(remote) {
-			return p
-		}
-	}
-	return nil
-}
-
-// A task is a
-type task func(*Agent)
-
-func (a *Agent) run(t task) error {
-	err := a.ok()
-	if err != nil {
-		return err
-	}
-
-	select {
-	case <-a.done:
-		return a.getErr()
-	case a.taskChan <- t:
-	}
-	return nil
-}
-
-func (a *Agent) taskLoop() {
-	for {
-		if a.selector != nil {
-			select {
-			case <-a.forceCandidateContact:
-				a.selector.ContactCandidates()
-			case <-a.connectivityTicker.C:
-				a.selector.ContactCandidates()
-			case t := <-a.taskChan:
-				// Run the task
-				t(a)
-
-			case <-a.done:
-				return
-			}
-		} else {
-			select {
-			case t := <-a.taskChan:
-				// Run the task
-				t(a)
-
-			case <-a.done:
-				return
-			}
-		}
-	}
-}
-
-// validateSelectedPair checks if the selected pair is (still) valid
-// Note: the caller should hold the agent lock.
-func (a *Agent) validateSelectedPair() bool {
-	selectedPair, err := a.getSelectedPair()
-	if err != nil {
-		return false
-	}
-
-	if (a.connectionTimeout != 0) &&
-		(time.Since(selectedPair.remote.LastReceived()) > a.connectionTimeout) {
-		a.selectedPairMutex.Lock()
-		a.selectedPair = nil
-		a.selectedPairMutex.Unlock()
-		a.updateConnectionState(ConnectionStateDisconnected)
-		return false
-	}
-
-	return true
-}
-
-// checkKeepalive sends STUN Binding Indications to the selected pair
-// if no packet has been sent on that pair in the last keepaliveInterval
-// Note: the caller should hold the agent lock.
-func (a *Agent) checkKeepalive() {
-	selectedPair, err := a.getSelectedPair()
-	if err != nil {
-		return
-	}
-
-	if (a.keepaliveInterval != 0) &&
-		(time.Since(selectedPair.local.LastSent()) > a.keepaliveInterval) {
-		// we use binding request instead of indication to support refresh consent schemas
-		// see https://tools.ietf.org/html/rfc7675
-		a.selector.PingCandidate(selectedPair.local, selectedPair.remote)
-	}
-}
-
-// AddRemoteCandidate adds a new remote candidate
-func (a *Agent) AddRemoteCandidate(c Candidate) error {
-	// If we have a mDNS Candidate lets fully resolve it before adding it locally
-	if c.Type() == CandidateTypeHost && strings.HasSuffix(c.Address(), ".local") {
-		if a.mDNSMode == MulticastDNSModeDisabled {
-			a.log.Warnf("remote mDNS candidate added, but mDNS is disabled: (%s)", c.Address())
-			return nil
-		}
-
-		hostCandidate, ok := c.(*CandidateHost)
-		if !ok {
-			return ErrAddressParseFailed
-		}
-
-		go a.resolveAndAddMulticastCandidate(hostCandidate)
-		return nil
-	}
-
-	return a.run(func(agent *Agent) {
-		agent.addRemoteCandidate(c)
-	})
-}
-
-func (a *Agent) resolveAndAddMulticastCandidate(c *CandidateHost) {
-	_, src, err := a.mDNSConn.Query(context.TODO(), c.Address())
-	if err != nil {
-		a.log.Warnf("Failed to discover mDNS candidate %s: %v", c.Address(), err)
-		return
-	}
-
-	ip, _, _, _ := parseAddr(src)
-	if ip == nil {
-		a.log.Warnf("Failed to discover mDNS candidate %s: failed to parse IP", c.Address())
-		return
-	}
-
-	if err = c.setIP(ip); err != nil {
-		a.log.Warnf("Failed to discover mDNS candidate %s: %v", c.Address(), err)
-		return
-	}
-
-	if err = a.run(func(agent *Agent) {
-		agent.addRemoteCandidate(c)
-	}); err != nil {
-		a.log.Warnf("Failed to add mDNS candidate %s: %v", c.Address(), err)
-		return
-
-	}
-}
-
-func (a *Agent) requestConnectivityCheck() {
-	select {
-	case a.forceCandidateContact <- true:
-	default:
-	}
-}
-
-// addRemoteCandidate assumes you are holding the lock (must be execute using a.run)
-func (a *Agent) addRemoteCandidate(c Candidate) {
-	set := a.remoteCandidates[c.NetworkType()]
-
-	for _, candidate := range set {
-		if candidate.Equal(c) {
-			return
-		}
-	}
-
-	set = append(set, c)
-	a.remoteCandidates[c.NetworkType()] = set
-
-	if localCandidates, ok := a.localCandidates[c.NetworkType()]; ok {
-		for _, localCandidate := range localCandidates {
-			a.addPair(localCandidate, c)
-		}
-	}
-
-	a.requestConnectivityCheck()
-}
-
-// addCandidate assumes you are holding the lock (must be execute using a.run)
-func (a *Agent) addCandidate(c Candidate) {
-	set := a.localCandidates[c.NetworkType()]
-	for _, candidate := range set {
-		if candidate.Equal(c) {
-			return
-		}
-	}
-
-	set = append(set, c)
-	a.localCandidates[c.NetworkType()] = set
-
-	if remoteCandidates, ok := a.remoteCandidates[c.NetworkType()]; ok {
-		for _, remoteCandidate := range remoteCandidates {
-			a.addPair(c, remoteCandidate)
-		}
-	}
-}
-
-// GetLocalCandidates returns the local candidates
-func (a *Agent) GetLocalCandidates() ([]Candidate, error) {
-	res := make(chan []Candidate)
-
-	err := a.run(func(agent *Agent) {
-		var candidates []Candidate
-		for _, set := range agent.localCandidates {
-			candidates = append(candidates, set...)
-		}
-		res <- candidates
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return <-res, nil
-}
-
-// GetLocalUserCredentials returns the local user credentials
-func (a *Agent) GetLocalUserCredentials() (frag string, pwd string) {
-	return a.localUfrag, a.localPwd
-}
-
-// Close cleans up the Agent
-func (a *Agent) Close() error {
-	done := make(chan struct{})
-	err := a.run(func(agent *Agent) {
-		defer func() {
-			close(done)
-		}()
-		agent.err.Store(ErrClosed)
-		close(agent.done)
-
-		// Cleanup all candidates
-		for net, cs := range agent.localCandidates {
-			for _, c := range cs {
-				err := c.close()
-				if err != nil {
-					a.log.Warnf("Failed to close candidate %s: %v", c, err)
-				}
-			}
-			delete(agent.localCandidates, net)
-		}
-		for net, cs := range agent.remoteCandidates {
-			for _, c := range cs {
-				err := c.close()
-				if err != nil {
-					a.log.Warnf("Failed to close candidate %s: %v", c, err)
-				}
-			}
-			delete(agent.remoteCandidates, net)
-		}
-		if err := a.buffer.Close(); err != nil {
-			a.log.Warnf("failed to close buffer: %v", err)
-		}
-
-		if a.connectivityTicker != nil {
-			a.connectivityTicker.Stop()
-		}
-
-		a.closeMulticastConn()
-	})
-	if err != nil {
-		return err
-	}
-
-	<-done
-	a.updateConnectionState(ConnectionStateClosed)
-
-	return nil
-}
-
-func (a *Agent) findRemoteCandidate(networkType NetworkType, addr net.Addr) Candidate {
-	var ip net.IP
-	var port int
-
-	switch casted := addr.(type) {
-	case *net.UDPAddr:
-		ip = casted.IP
-		port = casted.Port
-	case *net.TCPAddr:
-		ip = casted.IP
-		port = casted.Port
-	default:
-		a.log.Warnf("unsupported address type %T", a)
-		return nil
-	}
-
-	set := a.remoteCandidates[networkType]
-	for _, c := range set {
-		if c.Address() == ip.String() && c.Port() == port {
-			return c
-		}
-	}
-	return nil
-}
-
-func (a *Agent) sendBindingRequest(m *stun.Message, local, remote Candidate) {
-	a.log.Tracef("ping STUN from %s to %s\n", local.String(), remote.String())
-
-	if overflow := len(a.pendingBindingRequests) - (maxPendingBindingRequests - 1); overflow > 0 {
-		a.log.Debugf("Discarded %d pending binding requests, pendingBindingRequests is full", overflow)
-		a.pendingBindingRequests = a.pendingBindingRequests[overflow:]
-	}
-
-	useCandidate := m.Contains(stun.AttrUseCandidate)
-
-	a.pendingBindingRequests = append(a.pendingBindingRequests, bindingRequest{
-		transactionID:  m.TransactionID,
-		destination:    remote.addr(),
-		isUseCandidate: useCandidate,
-	})
-
-	a.sendSTUN(m, local, remote)
-}
-
-func (a *Agent) sendBindingSuccess(m *stun.Message, local, remote Candidate) {
-	base := remote
-	if out, err := stun.Build(m, stun.BindingSuccess,
-		&stun.XORMappedAddress{
-			IP:   base.addr().IP,
-			Port: base.addr().Port,
-		},
-		stun.NewShortTermIntegrity(a.localPwd),
-		stun.Fingerprint,
-	); err != nil {
-		a.log.Warnf("Failed to handle inbound ICE from: %s to: %s error: %s", local, remote, err)
-	} else {
-		a.sendSTUN(out, local, remote)
-	}
-}
-
-// Assert that the passed TransactionID is in our pendingBindingRequests and returns the destination
-// If the bindingRequest was valid remove it from our pending cache
-func (a *Agent) handleInboundBindingSuccess(id [stun.TransactionIDSize]byte) (bool, *bindingRequest) {
-	for i := range a.pendingBindingRequests {
-		if a.pendingBindingRequests[i].transactionID == id {
-			validBindingRequest := a.pendingBindingRequests[i]
-			a.pendingBindingRequests = append(a.pendingBindingRequests[:i], a.pendingBindingRequests[i+1:]...)
-			return true, &validBindingRequest
-		}
-	}
-	return false, nil
-}
-
-// handleInbound processes STUN traffic from a remote candidate
-func (a *Agent) handleInbound(m *stun.Message, local Candidate, remote net.Addr) {
-	var err error
-	if m == nil || local == nil {
-		return
-	}
-
-	if m.Type.Method != stun.MethodBinding ||
-		!(m.Type.Class == stun.ClassSuccessResponse ||
-			m.Type.Class == stun.ClassRequest ||
-			m.Type.Class == stun.ClassIndication) {
-		a.log.Tracef("unhandled STUN from %s to %s class(%s) method(%s)", remote, local, m.Type.Class, m.Type.Method)
-		return
-	}
-
-	if a.isControlling {
-		if m.Contains(stun.AttrICEControlling) {
-			a.log.Debug("inbound isControlling && a.isControlling == true")
-			return
-		} else if m.Contains(stun.AttrUseCandidate) {
-			a.log.Debug("useCandidate && a.isControlling == true")
-			return
-		}
-	} else {
-		if m.Contains(stun.AttrICEControlled) {
-			a.log.Debug("inbound isControlled && a.isControlling == false")
-			return
-		}
-	}
-
-	remoteCandidate := a.findRemoteCandidate(local.NetworkType(), remote)
-	if m.Type.Class == stun.ClassSuccessResponse {
-		if err = assertInboundMessageIntegrity(m, []byte(a.remotePwd)); err != nil {
-			a.log.Warnf("discard message from (%s), %v", remote, err)
-			return
-		}
-
-		if remoteCandidate == nil {
-			a.log.Warnf("discard success message from (%s), no such remote", remote)
-			return
-		}
-
-		a.selector.HandleSucessResponse(m, local, remoteCandidate, remote)
-	} else if m.Type.Class == stun.ClassRequest {
-		if err = assertInboundUsername(m, a.localUfrag+":"+a.remoteUfrag); err != nil {
-			a.log.Warnf("discard message from (%s), %v", remote, err)
-			return
-		} else if err = assertInboundMessageIntegrity(m, []byte(a.localPwd)); err != nil {
-			a.log.Warnf("discard message from (%s), %v", remote, err)
-			return
-		}
-
-		if remoteCandidate == nil {
-			ip, port, networkType, ok := parseAddr(remote)
-			if !ok {
-				a.log.Errorf("Failed to create parse remote net.Addr when creating remote prflx candidate")
-				return
-			}
-
-			prflxCandidateConfig := CandidatePeerReflexiveConfig{
-				Network:   networkType.String(),
-				Address:   ip.String(),
-				Port:      port,
-				Component: local.Component(),
-				RelAddr:   "",
-				RelPort:   0,
-			}
-
-			prflxCandidate, err := NewCandidatePeerReflexive(&prflxCandidateConfig)
-			if err != nil {
-				a.log.Errorf("Failed to create new remote prflx candidate (%s)", err)
-				return
-			}
-			remoteCandidate = prflxCandidate
-
-			a.log.Debugf("adding a new peer-reflexive candiate: %s ", remote)
-			a.addRemoteCandidate(remoteCandidate)
-		}
-
-		a.log.Tracef("inbound STUN (Request) from %s to %s", remote.String(), local.String())
-
-		a.selector.HandleBindingRequest(m, local, remoteCandidate)
-	}
-
-	if remoteCandidate != nil {
-		remoteCandidate.seen(false)
-	}
-}
-
-// noSTUNSeen processes non STUN traffic from a remote candidate,
-// and returns true if it is an actual remote candidate
-func (a *Agent) noSTUNSeen(local Candidate, remote net.Addr) bool {
-	remoteCandidate := a.findRemoteCandidate(local.NetworkType(), remote)
-	if remoteCandidate == nil {
-		return false
-	}
-
-	remoteCandidate.seen(false)
-	return true
-}
-
-func (a *Agent) getSelectedPair() (*candidatePair, error) {
-	a.selectedPairMutex.RLock()
-	selectedPair := a.selectedPair
-	a.selectedPairMutex.RUnlock()
-
-	if selectedPair == nil {
-		return nil, ErrNoCandidatePairs
-	}
-
-	return selectedPair, nil
-}
-
-func (a *Agent) closeMulticastConn() {
-	if a.mDNSConn != nil {
-		if err := a.mDNSConn.Close(); err != nil {
-			a.log.Warnf("failed to close mDNS Conn: %v", err)
-		}
-	}
-}
-
-// GetCandidatePairsStats returns a list of candidate pair stats
-func (a *Agent) GetCandidatePairsStats() []CandidatePairStats {
-	resultChan := make(chan []CandidatePairStats)
-	err := a.run(func(agent *Agent) {
-		result := make([]CandidatePairStats, 0, len(agent.checklist))
-		for _, cp := range agent.checklist {
-			stat := CandidatePairStats{
-				Timestamp:         time.Now(),
-				LocalCandidateID:  cp.local.ID(),
-				RemoteCandidateID: cp.remote.ID(),
-				State:             cp.state,
-				Nominated:         cp.nominated,
-				// PacketsSent uint32
-				// PacketsReceived uint32
-				// BytesSent uint64
-				// BytesReceived uint64
-				// LastPacketSentTimestamp time.Time
-				// LastPacketReceivedTimestamp time.Time
-				// FirstRequestTimestamp time.Time
-				// LastRequestTimestamp time.Time
-				// LastResponseTimestamp time.Time
-				// TotalRoundTripTime float64
-				// CurrentRoundTripTime float64
-				// AvailableOutgoingBitrate float64
-				// AvailableIncomingBitrate float64
-				// CircuitBreakerTriggerCount uint32
-				// RequestsReceived uint64
-				// RequestsSent uint64
-				// ResponsesReceived uint64
-				// ResponsesSent uint64
-				// RetransmissionsReceived uint64
-				// RetransmissionsSent uint64
-				// ConsentRequestsSent uint64
-				// ConsentExpiredTimestamp time.Time
-			}
-			result = append(result, stat)
-		}
-		resultChan <- result
-	})
-	if err != nil {
-		a.log.Errorf("error getting candidate pairs stats %v", err)
-		return []CandidatePairStats{}
-	}
-	return <-resultChan
-}
-
-// GetLocalCandidatesStats returns a list of local candidates stats
-func (a *Agent) GetLocalCandidatesStats() []CandidateStats {
-	resultChan := make(chan []CandidateStats)
-	err := a.run(func(agent *Agent) {
-		result := make([]CandidateStats, 0, len(agent.localCandidates))
-		for networkType, localCandidates := range agent.localCandidates {
-			for _, c := range localCandidates {
-				stat := CandidateStats{
-					Timestamp:     time.Now(),
-					ID:            c.ID(),
-					NetworkType:   networkType,
-					IP:            c.Address(),
-					Port:          c.Port(),
-					CandidateType: c.Type(),
-					Priority:      c.Priority(),
-					// URL string
-					RelayProtocol: "udp",
-					// Deleted bool
-				}
-				result = append(result, stat)
-			}
-		}
-		resultChan <- result
-	})
-	if err != nil {
-		a.log.Errorf("error getting candidate pairs stats %v", err)
-		return []CandidateStats{}
-	}
-	return <-resultChan
-}
-
-// GetRemoteCandidatesStats returns a list of remote candidates stats
-func (a *Agent) GetRemoteCandidatesStats() []CandidateStats {
-	resultChan := make(chan []CandidateStats)
-	err := a.run(func(agent *Agent) {
-		result := make([]CandidateStats, 0, len(agent.remoteCandidates))
-		for networkType, localCandidates := range agent.remoteCandidates {
-			for _, c := range localCandidates {
-				stat := CandidateStats{
-					Timestamp:     time.Now(),
-					ID:            c.ID(),
-					NetworkType:   networkType,
-					IP:            c.Address(),
-					Port:          c.Port(),
-					CandidateType: c.Type(),
-					Priority:      c.Priority(),
-					// URL string
-					RelayProtocol: "udp",
-				}
-				result = append(result, stat)
-			}
-		}
-		resultChan <- result
-	})
-	if err != nil {
-		a.log.Errorf("error getting candidate pairs stats %v", err)
-		return []CandidateStats{}
-	}
-	return <-resultChan
-}
-
-// Role represents ICE agent role, which can be controlling or controlled.
-type Role byte
-
-// UnmarshalText implements TextUnmarshaler.
-func (r *Role) UnmarshalText(text []byte) error {
-	switch string(text) {
-	case "controlling":
-		*r = Controlling
-	case "controlled":
-		*r = Controlled
-	default:
-		return fmt.Errorf("unknown role %q", text)
-	}
-	return nil
-}
-
-// MarshalText implements TextMarshaler.
-func (r Role) MarshalText() (text []byte, err error) {
-	return []byte(r.String()), nil
-}
-
-func (r Role) String() string {
-	switch r {
+	switch remoteControlAttribute.Role {
 	case Controlling:
-		return "controlling"
+		if a.isControlling {
+			if a.tieBreaker >= remoteTieBreaker {
+				a.log.Infof("agent will insist on being controlling due to tiebreaker")
+				ret := stun.ErrorCodeAttribute{Code: stun.CodeRoleConflict, Reason: []byte("Agent is in controlling role")}
+				return false, ret
+			} else {
+				a.log.Infof("agent is switching to controlled mode due to tiebreaker")
+				a.isControlling = false
+
+				a.recalculatePairPriorities()
+
+				return true, AttrControl {
+					Role: Controlled,
+					Tiebreaker: a.tieBreaker,
+				}
+			}
+		}
+		break
 	case Controlled:
-		return "controlled"
-	default:
-		return "unknown"
+		if !a.isControlling {
+			if a.tieBreaker >= remoteTieBreaker {
+				a.log.Infof("agent is switching to controlling mode due to tiebreaker")
+				a.isControlling = true
+
+				a.recalculatePairPriorities()
+
+				return true, AttrControl {
+					Role: Controlling,
+					Tiebreaker: a.tieBreaker,
+				}
+			} else {
+				a.log.Infof("agent will insist on being controlled due to tiebreaker")
+				ret := stun.ErrorCodeAttribute{Code: stun.CodeRoleConflict, Reason: []byte("Agent is in controlled role")}
+				return false, ret
+
+			}
+		}
+		break
+	}
+
+	return true, nil
+}
+
+//TODO: implement me (this is non-blocking as block is upstream in code)
+func (a *Agent) recalculatePairPriorities() {
+
+}
+
+func (a *Agent) negotiatePacing(request *int) int {
+	a.mux.Lock()
+	defer a.mux.Unlock()
+
+	currentPacing := a.stunPacer.getPacing()
+
+	if request != nil {
+		requestedPacing := *request
+
+		if requestedPacing > minPacing {
+			a.log.Warnf("remote peer requested pacing >%dms, will try to use local pacing of %dms instead", requestedPacing, currentPacing)
+		} else {
+			if requestedPacing > currentPacing {
+				a.log.Debugf("remote peer proposed greater value of %dms for pacing - using it", requestedPacing)
+				a.stunPacer.setPacing(requestedPacing)
+				return requestedPacing
+			} else {
+				a.log.Debugf("remote peer requested pacing that is lower than local, using local value of %dms", currentPacing)
+			}
+		}
+	} else {
+		a.log.Debugf("remote peer didn't propose pacing - using local value of %dms", currentPacing)
+	}
+
+	return currentPacing
+}
+
+func (a *Agent) processRemoteCandidate(candidate *Candidate) {
+	a.mux.Lock()
+	defer a.mux.Unlock()
+
+	connState := a.connectionState
+
+	switch connState {
+	case ConnectionStateNew:
+		a.setConnectionState(ConnectionStateChecking)
+		break
+	case ConnectionStateDisconnected, ConnectionStateClosed, ConnectionStateFailed, ConnectionStateCompleted:
+		a.log.Debugf("received remote candidate for connection in state: %s - ignoring", connState)
+		break
 	}
 }
 
-// Possible ICE agent roles.
-const (
-	Controlling Role = iota
-	Controlled
-)
+func (a *Agent) negotiateStandard(peerOptions []ICEOption) bool {
+	a.mux.Lock()
+	defer a.mux.Unlock()
+
+	peerConfirmed8445 := false
+
+	for _, opt := range peerOptions {
+		switch opt {
+		case ICEOptionICE2:
+			a.log.Debugf("peer confirmed RFC8455 support. VERY NICE! GREAT SUCCESS!")
+			a.remoteStandard = ICEStandardRFC8445
+			peerConfirmed8445 = true
+		}
+	}
+
+	if !peerConfirmed8445 {
+		a.log.Warnf("peer did not confirm RFC8445 support - we will try to run in compatibility mode")
+		a.remoteStandard = ICEStandardRFC5245
+	}
+
+	return peerConfirmed8445
+}
+
+//blocks until the proposal is ready as per the trickle mode
+func (a *Agent) startLocalOffer() {
+	a.mux.Lock()
+	defer a.mux.Unlock()
+
+	a.localTrickleState = TrickleStateWaiting
+
+	for _, str := range a.Streams {
+		go str.gather()
+	}
+}
+
+//this has to be run within blocking context to avoid race conditions with losing/duplicating candidates
+func (a *Agent) generateOffer() {
+	streamsProps := []RemoteStreamRequest{}
+
+	var iceMode ICEMode
+	iceMode = ICEModeFull
+
+	currPacing := a.stunPacer.getPacing()
+
+	opts := SessionParameters{
+		Pacing:  &currPacing,
+		Mode:    &iceMode,
+		Options: []ICEOption{},
+	}
+
+	if a.localStandard == ICEStandardRFC8445 {
+		opts.Options = append(opts.Options, ICEOptionICE2)
+	}
+
+	//flush queues
+	offers, candidates, eocs := a.localSignalQueue.flush()
+
+	if offers != nil && len(offers) > 0 {
+		a.log.Warnf("offer was already in queue: something has gone wrong")
+	}
+
+	for streamId, stream := range a.Streams {
+		streamProp := &RemoteStreamRequest{
+			ID:                streamId,
+			Trickle:           stream.localTrickleMode == TrickleModeFull || stream.localTrickleMode == TrickleModeHalf,
+			StreamCredentials: stream.localCredentials,
+			EndOfCandidates:   false,
+			Components:        []RemoteComponentRequest{},
+		}
+
+		for compId, _ := range stream.Components {
+			compProp := RemoteComponentRequest{
+				ID:               compId,
+				Candidates:       nil,
+				RelatedComponent: nil,
+			}
+
+			for _, compSig := range candidates {
+				if compSig.StreamId == streamId && compSig.Candidate.ComponentId == compId {
+					compProp.Candidates = append(compProp.Candidates, compSig.Candidate)
+				}
+			}
+
+			streamProp.Components = append(streamProp.Components, compProp)
+		}
+
+		for _, eocSig := range eocs {
+			if eocSig.StreamId == streamId {
+				streamProp.EndOfCandidates = true
+				break
+			}
+		}
+
+		streamsProps = append(streamsProps, *streamProp);
+	}
+
+
+	res := &RemoteSessionRequest{
+		Options:            opts,
+		SessionCredentials: &a.localCredentials,
+		Streams:            streamsProps,
+	}
+
+	a.localTrickleState = TrickleStateOfferReady
+	a.localSignalQueue.offer <- &SignalOffer{Request: *res}
+}
+
+func (a *Agent) processRemoteTrickleState(stream *Stream, state TrickleState) {
+	a.mux.Lock()
+	defer a.mux.Unlock()
+
+	finished := true
+
+	if state == TrickleStateFinished {
+		for _, stream := range a.Streams {
+			if stream.getRemoteTrickleState() != TrickleStateFinished {
+				finished = false
+				break
+			}
+		}
+	}
+
+	if finished {
+		a.remoteTrickleState = TrickleStateFinished
+	} else {
+		//doesn't matter - let's assume they are trickling
+		a.remoteTrickleState = TrickleStateTrickling
+	}
+}
+
+func (a *Agent) processLocalTrickleState(stream *Stream, state TrickleState) {
+	a.mux.Lock()
+	defer a.mux.Unlock()
+
+	currState := a.localTrickleState
+
+	if currState == TrickleStateFinished {
+		a.log.Warnf("local trickle state change after trickling has finished - something has gone wrong")
+		return
+	}
+
+	switch state {
+	case TrickleStateWaiting, TrickleStateNew:
+		if currState == TrickleStateOfferReady || currState == TrickleStateFinished || currState == TrickleStateTrickling {
+			a.log.Warnf("trying to decrease trickle status, curr=%s, stream reported=%s - ignoring", currState, state)
+			return
+		}
+
+		a.localTrickleState = TrickleStateWaiting
+		return
+	case TrickleStateOfferReady:
+		ready := true
+
+		for _, str := range a.Streams {
+			if str.getLocalTrickleState() == TrickleStateNew || str.getLocalTrickleState() == TrickleStateWaiting {
+				ready = false
+				break
+			}
+		}
+
+		if ready {
+			//trickle state is updated inside that function
+			a.generateOffer()
+		}
+		break
+	case TrickleStateTrickling:
+		trickling := true
+
+		for _, str := range a.Streams {
+			if str.getLocalTrickleState() != TrickleStateFinished && str.getLocalTrickleState() != TrickleStateTrickling {
+				trickling = false
+				break
+			}
+		}
+
+		if trickling {
+			a.localTrickleState = TrickleStateTrickling
+		}
+		break
+	case TrickleStateFinished:
+		finished := true
+
+		for _, str := range a.Streams {
+			if str.getLocalTrickleState() != TrickleStateFinished {
+				finished = false
+				break
+			}
+		}
+
+		if finished {
+			a.localTrickleState = TrickleStateFinished
+		}
+	}
+}

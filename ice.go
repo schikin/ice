@@ -1,76 +1,104 @@
 package ice
 
-// ConnectionState is an enum showing the state of a ICE Connection
-type ConnectionState int
-
-// List of supported States
-const (
-	// ConnectionStateNew ICE agent is gathering addresses
-	ConnectionStateNew = iota + 1
-
-	// ConnectionStateChecking ICE agent has been given local and remote candidates, and is attempting to find a match
-	ConnectionStateChecking
-
-	// ConnectionStateConnected ICE agent has a pairing, but is still checking other pairs
-	ConnectionStateConnected
-
-	// ConnectionStateCompleted ICE agent has finished
-	ConnectionStateCompleted
-
-	// ConnectionStateFailed ICE agent never could successfully connect
-	ConnectionStateFailed
-
-	// ConnectionStateDisconnected ICE agent connected successfully, but has entered a failed state
-	ConnectionStateDisconnected
-
-	// ConnectionStateClosed ICE agent has finished and is no longer handling requests
-	ConnectionStateClosed
+import (
+	"fmt"
 )
 
-func (c ConnectionState) String() string {
-	switch c {
-	case ConnectionStateNew:
-		return "New"
-	case ConnectionStateChecking:
-		return "Checking"
-	case ConnectionStateConnected:
-		return "Connected"
-	case ConnectionStateCompleted:
-		return "Completed"
-	case ConnectionStateFailed:
-		return "Failed"
-	case ConnectionStateDisconnected:
-		return "Disconnected"
-	case ConnectionStateClosed:
-		return "Closed"
+type ICERole int
+
+const (
+	// StreamStateNew This agent is controlling
+	ICERoleControlling = iota + 1
+
+	// ICERoleControlled This agent is controlled
+	ICERoleControlled
+)
+
+type ICEOption int
+
+const (
+	// StreamStateNew ICE2
+	ICEOptionICE2 = iota + 1
+
+	// ICEOptionRTPECN RFC6679
+	ICEOptionRTPECN
+)
+
+type SessionParameters struct {
+	Pacing *int
+	Mode *ICEMode
+	Options []ICEOption
+}
+
+type MulticastDNSParams struct {
+	Mode	MulticastDNSMode
+	Name	string
+}
+
+// Role represents ICE agent role, which can be controlling or controlled.
+type Role byte
+
+// UnmarshalText implements TextUnmarshaler.
+func (r *Role) UnmarshalText(text []byte) error {
+	switch string(text) {
+	case "controlling":
+		*r = Controlling
+	case "controlled":
+		*r = Controlled
 	default:
-		return "Invalid"
+		return fmt.Errorf("unknown role %q", text)
+	}
+	return nil
+}
+
+// MarshalText implements TextMarshaler.
+func (r Role) MarshalText() (text []byte, err error) {
+	return []byte(r.String()), nil
+}
+
+func (r Role) String() string {
+	switch r {
+	case Controlling:
+		return "controlling"
+	case Controlled:
+		return "controlled"
+	default:
+		return "unknown"
 	}
 }
 
-// GatheringState describes the state of the candidate gathering process
-type GatheringState int
-
+// Possible ICE agent roles.
 const (
-	// GatheringStateNew indicates candidate gatering is not yet started
-	GatheringStateNew GatheringState = iota + 1
-
-	// GatheringStateGathering indicates candidate gatering is ongoing
-	GatheringStateGathering
-
-	// GatheringStateComplete indicates candidate gatering has been completed
-	GatheringStateComplete
+	Controlling Role = iota
+	Controlled
 )
 
-func (t GatheringState) String() string {
-	switch t {
-	case GatheringStateNew:
-		return "new"
-	case GatheringStateGathering:
-		return "gathering"
-	case GatheringStateComplete:
-		return "complete"
+type ICEStandard int
+
+const (
+	ICEStandardRFC8445 ICEStandard = iota + 1
+	ICEStandardRFC5245
+)
+
+func (s ICEStandard) String() string {
+	switch s {
+	case ICEStandardRFC8445:
+		return "RFC8445"
+	case ICEStandardRFC5245:
+		return "RFC5245"
 	default:
-		return ErrUnknownType.Error()
+		return "unknown"
 	}
 }
+
+type ICEMode int
+
+// List of supported modes
+const (
+	// ICEModeFull ICE Full
+	ICEModeFull = iota + 1
+
+	// ICEModeLite ICE Lite
+	ICEModeLite
+)
+

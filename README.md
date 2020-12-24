@@ -19,6 +19,13 @@
 ### Roadmap
 The library is used as a part of our WebRTC implementation. Please refer to that [roadmap](https://github.com/pion/webrtc/issues/9) to track our major milestones.
 
+### Relevant standards
+* [RFC 8445](https://tools.ietf.org/html/rfc8445) - current ICE standard
+* [RFC 5245](https://tools.ietf.org/html/rfc5245) - obsolete ICE standard that is still in use and has to be supported
+
+**Not supported standards**
+* [draft-ietf-ice-rfc5245bis](https://tools.ietf.org/html/draft-ietf-ice-rfc5245bis-00) - this is expired, never approved, `a=a=ice-options:ice2` will be overriden
+
 ### Community
 Pion has an active community on the [Golang Slack](https://invite.slack.golangbridge.org/). Sign up and join the **#pion** channel for discussions and support. You can also use [Pion mailing list](https://groups.google.com/forum/#!forum/pion).
 
