@@ -24,6 +24,7 @@ type Base interface {
 	Port() int
 	Component() *Component
 	Connection() net.PacketConn
+	LocalAddr() net.Addr
 
 	start() error
 	close() error
@@ -38,6 +39,10 @@ type UdpBase struct {
 	component *Component
 
 	conn vnet.UDPPacketConn
+}
+
+func (u *UdpBase) LocalAddr() net.Addr {
+	return u.addr
 }
 
 func (u *UdpBase) NetworkType() NetworkType {

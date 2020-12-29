@@ -226,6 +226,22 @@ func resolveRemoteAddr(remote net.Addr) (net.IP, int, error) {
 	}
 }
 
+func (c *Component) buildBindingResponse(remote net.Addr, message *stun.Message) (*stun.Message, error) {
+	ip, port, err := resolveRemoteAddr(remote)
+
+	if err != nil {
+		return nil, fmt.Errorf("STUN request processing internal failure: %v", err)
+	}
+
+	return stun.Build(message, stun.BindingSuccess,
+		&stun.XORMappedAddress{
+			IP:   ip,
+			Port: port,
+		},
+		stun.NewShortTermIntegrity(c.Stream.getLocalCredentials().Pwd),
+		stun.Fingerprint)
+}
+
 /*
 	https://tools.ietf.org/html/rfc8445#section-7.3
 
@@ -237,26 +253,15 @@ func resolveRemoteAddr(remote net.Addr) (net.IP, int, error) {
 	information at this point to generate the response;
 
  */
-func (c *Component) respondToEarly(base Base, remote net.Addr, message *stun.Message) {
-	ip, port, err := resolveRemoteAddr(remote)
+func (c *Component) respondBindingEarly(base Base, remote net.Addr, message *stun.Message) {
+	out, err := c.buildBindingResponse(remote, message)
 
 	if err != nil {
-		c.log.Errorf("STUN request processing internal failure: ", err)
+		c.log.Warnf("failed to handle inbound STUN from: %s to: %s error: %s", remote, base.Address(), err)
 		return
 	}
 
-	if out, err := stun.Build(message, stun.BindingSuccess,
-		&stun.XORMappedAddress{
-			IP:   ip,
-			Port: port,
-		},
-		stun.NewShortTermIntegrity(c.Stream.getLocalCredentials().Pwd),
-		stun.Fingerprint,
-	); err != nil {
-		c.log.Warnf("failed to handle inbound ICE from: %s to: %s error: %s", remote, base.Address(), err)
-	} else {
-		c.sendStun(base, remote, out)
-	}
+	c.sendStun(base, remote, out)
 }
 
 func (c *Component) sendStun(base Base, remote net.Addr, message *stun.Message) {
@@ -267,29 +272,169 @@ func (c *Component) sendStun(base Base, remote net.Addr, message *stun.Message) 
 /*
 	https://tools.ietf.org/html/rfc8445#section-7.3.1.3
 
-	follows the rest of procedures for
+	follows full procedure for inbound request processing
  */
 func (c *Component) respondBindingFull(base Base, remote net.Addr, message *stun.Message) {
-	ip, port, err := resolveRemoteAddr(remote)
+	response, err := c.buildBindingResponse(remote, message)
 
 	if err != nil {
-		c.log.Errorf("STUN request processing internal failure: ", err)
+		c.log.Warnf("failed to handle inbound STUN from: %s to: %s error: %s", remote, base.Address(), err)
 		return
 	}
 
-	if out, err := stun.Build(message, stun.BindingSuccess,
-		&stun.XORMappedAddress{
-			IP:   ip,
-			Port: port,
-		},
-		stun.NewShortTermIntegrity(c.Stream.getLocalCredentials().Pwd),
-		stun.Fingerprint,
-	); err != nil {
-		c.log.Warnf("failed to handle inbound ICE from: %s to: %s error: %s", remote, base.Address(), err)
-	} else {
-		out.Encode()
-		go base.write(out.Raw, remote)
+	prflxCandidate, err := c.discoverPeerReflexive(base, remote, message)
+
+	if err != nil {
+		c.log.Warnf("failed to discover peer reflexive candidate - processing will continue: %v", err)
 	}
+
+	pair, err := c.generateTriggeredCheck(base, remote, prflxCandidate)
+
+	if err != nil {
+		c.log.Errorf("failed to generate triggered check - responding with error: %v", err)
+		c.sendBindingError(base, remote, message, stun.CodeServerError, "Internal error while generating triggered check")
+		return
+	}
+
+	err = c.checkNominatedFlag(message, pair)
+
+	if err != nil {
+		c.log.Errorf("nomination flag check failed - responding with error: %v", err)
+		c.sendBindingError(base, remote, message, stun.CodeBadRequest, "Illegal usage of ")
+		return
+	}
+
+	c.sendStun(base, remote, response)
+}
+
+/*
+   7.3.1.3.  Learning Peer-Reflexive Candidates
+
+   If the source transport address of the request does not match any
+   existing remote candidates, it represents a new peer-reflexive remote
+   candidate.  This candidate is constructed as follows:
+
+   o  The type is peer reflexive.
+
+   o  The priority is the value of the PRIORITY attribute in the Binding
+      request.
+
+   o  The foundation is an arbitrary value, different from the
+      foundations of all other remote candidates.  If any subsequent
+      candidate exchanges contain this peer-reflexive candidate, it will
+      signal the actual foundation for the candidate.
+
+   o  The component ID is the component ID of the local candidate to
+      which the request was sent.
+
+   This candidate is added to the list of remote candidates.  However,
+   the ICE agent does not pair this candidate with any local candidates.
+*/
+func (c *Component) discoverPeerReflexive(base Base, remote net.Addr, message *stun.Message) (*Candidate, error) {
+	ip, port, err := resolveRemoteAddr(remote)
+
+	if err != nil {
+		return nil, err
+	}
+
+	remoteCandidates := c.Stream.checklist.getRemoteCandidates()
+
+	for _, cand := range remoteCandidates {
+		if cand.TransportHost == ip.String() && cand.TransportPort == port {
+			c.log.Debugf("found matching candidate for inbound request: %s - no peer reflexive candidate will be created", cand.String())
+			return nil, nil
+		}
+	}
+
+	priorityBytes, err := message.Get(stun.AttrPriority)
+
+	if err != nil {
+		c.log.Warnf("received STUN request without PRIORITY attribute. no peer-reflexive candidate can be constructed: %v", err)
+		return nil, err
+	}
+
+	priority := bin.Uint32(priorityBytes)
+	network := base.NetworkType().NetworkShort()
+
+	cb := &Candidate{
+		Foundation:    c.Stream.Agent.foundationGenerator.generate(network, base.IP(), &ip, CandidateTypePeerReflexive), //this is a bit non-conforming to standard but much easier to implement
+		ComponentId:   c.ID,
+		Transport:     network,
+		TransportHost: ip.String(),
+		TransportPort: port,
+		Priority:      priority,
+		Type:          CandidateTypePeerReflexive,
+		RelatedHost:   base.IP().String(),
+		RelatedPort:   base.Port(),
+	}
+
+	c.Stream.checklist.processPeerReflexiveCandidate(cb)
+
+	return cb, nil
+}
+
+/*
+	https://tools.ietf.org/html/rfc8445#section-7.3.1.4
+	7.3.1.4.  Triggered Checks
+ */
+func (c *Component) generateTriggeredCheck(base Base, remote net.Addr, prflxCandidate *Candidate) (*CandidatePair, error) {
+	existingPair := c.Stream.checklist.lookupPair(base.LocalAddr(), remote)
+
+	if existingPair != nil {
+		c.log.Debugf("found existing pair for the transport address - no prflx pair will be created: %s", existingPair.String())
+
+		pairState := existingPair.getState()
+
+
+
+		return existingPair, nil
+	}
+
+	if prflxCandidate == nil {
+		return nil, fmt.Errorf("have to construct peer-reflexive pair but no peer-reflexive candidate was provided")
+	}
+
+	localCandidates := c.Stream.checklist.getLocalCandidates()
+	var localCandidate *LocalCandidate
+
+	for _, cand := range localCandidates {
+		if cand.Type != CandidateTypeHost && cand.Type != CandidateTypeRelay {
+			continue
+		}
+
+		if cand.base.Equals(base) {
+			localCandidate = cand
+			break
+		}
+	}
+
+	if localCandidate == nil {
+		return nil, fmt.Errorf("failed to find appropriate local candidate for prflx pair")
+	}
+
+	newPair := newCandidatePair(localCandidate, prflxCandidate)
+
+	return nil, nil
+}
+
+/*
+	https://tools.ietf.org/html/rfc8445#section-7.3.1.5
+	7.3.1.5.  Updating the Nominated Flag
+ */
+func (c *Component) checkNominatedFlag(message *stun.Message, pair *CandidatePair) error {
+
+	return nil
+}
+
+func (c *Component) sendBindingError(base Base, remote net.Addr, message *stun.Message, code stun.ErrorCode, reason string) {
+	errMessage, err := stun.Build(message, stun.BindingError, stun.ErrorCodeAttribute{Code: code, Reason: []byte(reason)})
+
+	if err != nil {
+		c.log.Errorf("failed to build STUN error response: %v", err)
+		return
+	}
+
+	c.sendStun(base, remote, errMessage)
 }
 
 func (c *Component) recvStunRequest(base Base, remote net.Addr, message *stun.Message) {
@@ -328,7 +473,7 @@ func (c *Component) recvStunRequest(base Base, remote net.Addr, message *stun.Me
 	}
 
 	if c.Stream.getRemoteCredentials() == nil {
-		c.respondToEarly(base, remote, response)
+		c.respondBindingEarly(base, remote, response)
 	} else {
 		//validate the credentials
 		credsErr := c.validateRemoteCredentials(message)
@@ -336,19 +481,11 @@ func (c *Component) recvStunRequest(base Base, remote net.Addr, message *stun.Me
 		if credsErr != nil {
 			c.log.Infof("invalid credentials - dropping inbound STUN request: %v", credsErr)
 
-			errMessage, err := stun.Build(message, stun.BindingError, stun.ErrorCodeAttribute{Code: stun.CodeUnauthorized, Reason: []byte("Integrity check failed")})
-
-			if err != nil {
-				c.log.Errorf("failed to build STUN error response: %v", err)
-				return
-			}
-
-			c.sendStun(base, remote, errMessage)
-
+			c.sendBindingError(base, remote, message, stun.CodeUnauthorized, "Integrity check failed")
 			return
 		}
 
-		c.respondBindingFull()
+		c.respondBindingFull(base, remote, response)
 	}
 
 }

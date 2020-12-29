@@ -62,6 +62,10 @@ type CandidatePair struct {
 	mux		sync.Mutex
 }
 
+func (cp *CandidatePair) String() string {
+	return fmt.Sprintf("local=%s, remote=%s, priority=%d, foundation: %s, state: %s", cp.local.String(), cp.remote.String(), cp.priority, cp.foundation, cp.state)
+}
+
 func newCandidatePair(local *LocalCandidate, remote *Candidate) *CandidatePair {
 	ret := &CandidatePair{
 		local:      local,

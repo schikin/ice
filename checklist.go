@@ -2,6 +2,7 @@ package ice
 
 import (
 	"container/heap"
+	"net"
 	"sync"
 )
 
@@ -96,6 +97,32 @@ type checklist struct {
 	mux sync.Mutex
 }
 
+func (c *checklist) lookupPair(localAddr net.Addr, remoteAddr net.Addr) *CandidatePair {
+	localIp, localPort, err := resolveRemoteAddr(localAddr)
+
+	if err != nil {
+		return nil
+	}
+
+	remoteIp, remotePort, err := resolveRemoteAddr(remoteAddr)
+
+	if err != nil {
+		return nil
+	}
+
+	//TODO: fix linear search at some point
+	for _, pair := range c.all {
+		if 	pair.local.TransportHost == localIp.String() &&
+			pair.local.TransportPort == localPort &&
+			pair.remote.TransportHost == remoteIp.String() &&
+			pair.remote.TransportPort == remotePort {
+			return pair
+		}
+	}
+
+	return nil
+}
+
 func (c *checklist) getState() ChecklistState {
 	c.mux.Lock()
 	defer c.mux.Unlock()
@@ -126,10 +153,41 @@ func (c *checklist) performConnectivityTrickle() bool {
 		return false
 	}
 
+	return true
+}
+
+func (c *checklist) getLocalCandidates() []*LocalCandidate {
+	c.mux.Lock()
+	defer c.mux.Unlock()
+
+	return c.localCandidates
+}
+
+func (c *checklist) getRemoteCandidates() []*Candidate {
+	c.mux.Lock()
+	defer c.mux.Unlock()
+
+	return c.remoteCandidates
 }
 
 func (c *checklist) processLocalCandidate(candidate *LocalCandidate) {
+	c.mux.Lock()
+	defer c.mux.Unlock()
 
+	c.localCandidates = append(c.localCandidates, candidate)
+
+	for _, remote := range c.remoteCandidates {
+		pair := newCandidatePair(candidate, remote)
+
+		c.all = append(c.all, pair)
+	}
+}
+
+func (c *checklist) processPeerReflexiveCandidate(candidate *Candidate) {
+	c.mux.Lock()
+	defer c.mux.Unlock()
+
+	c.remoteCandidates = append(c.remoteCandidates, candidate)
 }
 
 func (c *checklist) processRemoteCandidate(candidate *Candidate) {
