@@ -385,7 +385,24 @@ func (c *Component) generateTriggeredCheck(base Base, remote net.Addr, prflxCand
 
 		pairState := existingPair.getState()
 
+		switch pairState {
+		case CandidatePairStateSucceeded:
+			c.log.Debugf("found pair is SUCCEEDED - nothing else to be done with regard to triggered check")
+			break
+		case CandidatePairStateInProgress:
+			c.log.Debugf("found pair is IN-PROGRESS - flagging as soft-failed, setting to waiting and putting on triggered check list")
+			existingPair.flagSoftFail()
+			existingPair.setState(CandidatePairStateWaiting)
 
+			c.Stream.checklist.pushTriggeredQueue(existingPair)
+
+			break
+		default:
+			c.log.Debugf("found pair is '%s' - pushing to triggered checklist")
+
+			existingPair.setState(CandidatePairStateWaiting)
+			c.Stream.checklist.pushTriggeredQueue(existingPair)
+		}
 
 		return existingPair, nil
 	}
@@ -413,8 +430,10 @@ func (c *Component) generateTriggeredCheck(base Base, remote net.Addr, prflxCand
 	}
 
 	newPair := newCandidatePair(localCandidate, prflxCandidate)
+	newPair.setState(CandidatePairStateWaiting)
+	c.Stream.checklist.addAndPushToTriggeredQueue(newPair)
 
-	return nil, nil
+	return newPair, nil
 }
 
 /*
@@ -422,6 +441,8 @@ func (c *Component) generateTriggeredCheck(base Base, remote net.Addr, prflxCand
 	7.3.1.5.  Updating the Nominated Flag
  */
 func (c *Component) checkNominatedFlag(message *stun.Message, pair *CandidatePair) error {
+
+	
 
 	return nil
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/pion/stun"
@@ -30,14 +31,48 @@ func assertInboundMessageIntegrity(m *stun.Message, key []byte) error {
 	return messageIntegrityAttr.Check(m)
 }
 
+type TrxState int
+
+const (
+	TrxStateNew TrxState = iota + 1
+	TrxStateQueued
+	TrxStateInProgress
+	TrxStateCancelled
+	TrxStateFailed
+	TrxStateSuccess
+)
+
+func (c TrxState) String() string {
+	switch c {
+	case TrxStateNew:
+		return "new"
+	case TrxStateQueued:
+		return "queued"
+	case TrxStateInProgress:
+		return "in-progress"
+	case TrxStateCancelled:
+		return "cancel"
+	case TrxStateFailed:
+		return "failed"
+	case TrxStateSuccess:
+		return "success"
+	}
+	return "Unknown trx state"
+}
+
 //TODO: RTO
 type STUNTransaction struct {
 	Message *stun.Message
 	Base Base
 	Target net.Addr
 	Timeout time.Duration
+	RTO time.Duration
 	StringId string
 
+	softFail	  bool
+	state         TrxState
+	pacer         *stunPacer
+	mux           sync.Mutex
 	resultChannel chan *STUNResult
 }
 
@@ -47,44 +82,122 @@ type STUNResult struct {
 }
 
 func stunEncodeTrxId(data [stun.TransactionIDSize]byte) string {
-	return hex.EncodeToString(data[:]);
+	return hex.EncodeToString(data[:])
 }
 
-//this timeout accounts for both IO and pacing enqueue (that is, whatever is the reason for timeout)
-func executeStun(base Base, message *stun.Message, target net.Addr, timeout time.Duration) (*stun.Message, error) {
+/* During the ICE gathering phase, ICE agents SHOULD calculate the RTO
+   value using the following formula:
+
+     RTO = MAX (500ms, Ta * (Num-Of-Cands))
+
+     Num-Of-Cands: the number of server-reflexive and relay candidates
+
+ */
+func newStunTransactionGathering(base Base, message *stun.Message, target net.Addr) (*STUNTransaction, error) {
+	rto := 500 * time.Millisecond //TODO: proper RTO calculation to be done later
+
+	return newStunTransaction(base, message, target, rto)
+}
+
+func newStunTransactionCheck(base Base, message *stun.Message, target net.Addr) (*STUNTransaction, error) {
+	rto := 500 * time.Millisecond //just set at 500 - it's a bit more aggressive but spec allows it
+
+	return newStunTransaction(base, message, target, rto)
+}
+
+func newStunTransaction(base Base, message *stun.Message, target net.Addr, RTO time.Duration) (*STUNTransaction, error) {
 	trx := &STUNTransaction{
-		Message:       message,
-		Base:          base,
-		Target:		   target,
-		Timeout:	   timeout,
-		StringId:	   stunEncodeTrxId(message.TransactionID),
+		Message:  message,
+		Base:     base,
+		Target:   target,
+		RTO:      RTO,
+		Timeout:  2 * RTO, //Let HTO be the transaction timeout, which SHOULD be 2*RTT
+		StringId: stunEncodeTrxId(message.TransactionID),
+		state:    TrxStateNew,
+		pacer:    base.Component().Stream.Agent.stunPacer,
 
 		resultChannel: make(chan *STUNResult, 1), //make it buffered to avoid recv loop locking in case of misbehaving receiver
 	}
 
-	return trx.executePacedSync()
+	return trx, nil
 }
+
+func (trx *STUNTransaction) setSoftFail(softFail bool) {
+	trx.mux.Lock()
+	defer trx.mux.Unlock()
+
+	trx.softFail = softFail
+}
+
+func (trx *STUNTransaction) GetSoftFail() bool {
+	trx.mux.Lock()
+	defer trx.mux.Unlock()
+
+	return trx.softFail
+}
+
+func (trx *STUNTransaction) setState(state TrxState) {
+	trx.mux.Lock()
+	defer trx.mux.Unlock()
+
+	trx.state = state
+}
+
+func (trx *STUNTransaction) GetState() TrxState {
+	trx.mux.Lock()
+	defer trx.mux.Unlock()
+
+	return trx.state
+}
+
 
 func (trx *STUNTransaction) waitForResult() (*stun.Message, error) {
 	timeout := trx.Timeout
 
-	timer := time.NewTimer(timeout)
+	timeoutTimer := time.NewTimer(timeout)
+	rtoTimer := time.NewTimer(trx.RTO)
 
-	select {
-	case res, ok := <- trx.resultChannel:
-		if !ok {
-			return nil, fmt.Errorf("transaction cancelled")
+	comp := trx.Base.Component()
+
+	for {
+		select {
+		case res, ok := <-trx.resultChannel:
+			if !ok {
+				trx.setState(TrxStateCancelled)
+				return nil, fmt.Errorf("transaction cancelled")
+			}
+
+			return res.Response, nil
+		case <-rtoTimer.C:
+			state := trx.GetState()
+			softFail := trx.GetSoftFail()
+
+			switch state {
+			case TrxStateInProgress:
+				if softFail {
+					comp.log.Debugf("trxId=%s - no retransmitting due to softfail flag set", trx.StringId)
+				} else {
+					comp.log.Debugf("trxId=%s - retransmitting due to RTO timer", trx.StringId)
+					go trx.transmit()
+				}
+
+				break
+			default:
+				comp.log.Debugf("trxId=%s - RTO timer reached but wrong state - returning error")
+				trx.pacer.trxDequeue(trx.StringId) //it might still be in queue
+				return nil, fmt.Errorf("unexpected state during RTO: %s", state)
+			}
+
+		case <-timeoutTimer.C:
+			trx.pacer.trxDequeue(trx.StringId) //cleanup agent queue in case it was never dispatched (maybe queue was too long or sth)
+			trx.setState(TrxStateFailed)
+			return nil, fmt.Errorf("timeout reached")
 		}
-
-		return res.Response, nil
-	case <- timer.C:
-		trx.cancel() //cleanup agent queue in case it was never dispatched (maybe queue was too long or sth)
-		return nil, fmt.Errorf("timeout reached")
 	}
 }
 
 // enqueue the trx and blocking-wait for result
-func (trx *STUNTransaction) executePacedSync() (*stun.Message, error) {
+func (trx *STUNTransaction) ExecutePacedSync() (*stun.Message, error) {
 	base := trx.Base
 
 	base.Component().Stream.Agent.stunPacer.trxEnqueue(trx)
@@ -93,15 +206,15 @@ func (trx *STUNTransaction) executePacedSync() (*stun.Message, error) {
 }
 
 // enqueue the trx and wait for result in a separate goroutine
-func (trx *STUNTransaction) executePacedAsync(handler func(*stun.Message, error)) {
+func (trx *STUNTransaction) ExecutePacedAsync(handler func(*stun.Message, error)) {
 	go func() {
-		msg, err := trx.executePacedSync()
+		msg, err := trx.ExecutePacedSync()
 		handler(msg,err)
 	}()
 }
 
 // put directly on dispatched map and execute
-func (trx *STUNTransaction) executeImmediatelySync() (*stun.Message, error) {
+func (trx *STUNTransaction) ExecuteImmediatelySync() (*stun.Message, error) {
 	base := trx.Base
 
 	base.Component().Stream.Agent.stunPacer.trxExecuteNow(trx)
@@ -120,7 +233,8 @@ func (trx *STUNTransaction) transmit() {
 	if err != nil {
 		a.log.Debugf("IO failed for STUN trxId=%s: %v", trx.StringId, err)
 
-		a.stunPacer.trxFailed(trx.StringId)
+		trx.pacer.trxUndispatch(trx.StringId)
+		trx.setState(TrxStateFailed)
 
 		trx.resultChannel <- &STUNResult{
 			Response: nil,
@@ -130,9 +244,9 @@ func (trx *STUNTransaction) transmit() {
 }
 
 // execute the trx and wait for result in a separate goroutine
-func (trx *STUNTransaction) executeImmediatelyAsync(handler func(*stun.Message, error)) {
+func (trx *STUNTransaction) ExecuteImmediatelyAsync(handler func(*stun.Message, error)) {
 	go func() {
-		msg, err := trx.executeImmediatelySync()
+		msg, err := trx.ExecuteImmediatelySync()
 		handler(msg,err)
 	}()
 }
@@ -143,7 +257,7 @@ func (trx *STUNTransaction) cancel() {
 	trx.Base.Component().Stream.Agent.stunPacer.trxCancel(strId)
 }
 
-func stunBind(base Base, serverAddr net.Addr, deadline time.Duration) (*stun.XORMappedAddress, error) {
+func sendGatheringBind(base Base, serverAddr net.Addr) (*stun.XORMappedAddress, error) {
 	//stun.TransactionID is a default setter that will generate the random trx id for us
 	req, err := stun.Build(stun.BindingRequest, stun.TransactionID)
 
@@ -151,7 +265,13 @@ func stunBind(base Base, serverAddr net.Addr, deadline time.Duration) (*stun.XOR
 		return nil, err
 	}
 
-	res, err := executeStun(base, req, serverAddr, deadline)
+	trx, err := newStunTransactionGathering(base, req, serverAddr)
+
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := trx.ExecutePacedSync()
 
 	if err != nil {
 		return nil, err

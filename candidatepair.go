@@ -2,6 +2,8 @@ package ice
 
 import (
 	"fmt"
+	"github.com/pion/stun"
+	"net"
 	"sync"
 )
 
@@ -59,6 +61,8 @@ type CandidatePair struct {
 	// the pair)
 	foundation string
 
+	checkTrx	*STUNTransaction
+
 	mux		sync.Mutex
 }
 
@@ -93,6 +97,61 @@ func (cp *CandidatePair) getState() CandidatePairState {
 	defer cp.mux.Unlock()
 
 	return cp.state
+}
+
+func (cp *CandidatePair) flagSoftFail() {
+	cp.mux.Lock()
+	defer cp.mux.Unlock()
+
+	if cp.checkTrx != nil {
+		cp.checkTrx.setSoftFail(true)
+	}
+}
+
+func (cp *CandidatePair) stunTrxHandler(trx *STUNTransaction, message *stun.Message, err error) {
+	softFail := trx.GetSoftFail()
+
+	if err != nil {
+		if softFail {
+			//do nothing
+		} else {
+			cp.setState(CandidatePairStateFailed)
+			//do not signal upwards - it will be received during next round of checklisting
+		}
+	} else {
+		cp.setState(CandidatePairStateSucceeded)
+	}
+}
+
+func (cp *CandidatePair) startCheck() {
+	msg, err := stun.Build()
+
+	if err != nil {
+		cp.setState(CandidatePairStateFailed)
+		return
+	}
+
+	addrString := fmt.Sprintf("%s:%d", cp.remote.TransportHost, cp.remote.TransportPort)
+
+	addr, err := net.ResolveUDPAddr("udp", addrString)
+
+	if err != nil {
+		cp.setState(CandidatePairStateFailed)
+		return
+	}
+
+	trx, err := newStunTransactionCheck(cp.local.base, msg, addr)
+
+	if err != nil {
+		cp.setState(CandidatePairStateFailed)
+		return
+	}
+
+	var curriedHandler = func(message *stun.Message, err error) {
+		cp.stunTrxHandler(trx, message, err)
+	}
+
+	trx.ExecutePacedAsync(curriedHandler)
 }
 
 // RFC 5245 - 5.7.2.  Computing Pair Priority and Ordering Pairs

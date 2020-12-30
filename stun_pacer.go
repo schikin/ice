@@ -116,6 +116,7 @@ func (sp *stunPacer) onPacing() {
 		sp.trxDispatched[trx.StringId] = trx
 
 		sp.mux.Unlock()
+		trx.setState(TrxStateInProgress)
 		go trx.transmit()
 	} else {
 		sp.mux.Unlock()
@@ -145,6 +146,8 @@ func (sp *stunPacer) onInboundStun(base Base, message *stun.Message, remote net.
 
 		sp.log.Debugf("received response for trxId=%s", trxId)
 
+		trx.setState(TrxStateSuccess)
+
 		trx.resultChannel <- &STUNResult{
 			Response: message,
 			Error:    nil,
@@ -161,6 +164,7 @@ func (sp *stunPacer) trxEnqueue(trx *STUNTransaction) {
 	sp.mux.Lock()
 	defer sp.mux.Unlock()
 
+	trx.setState(TrxStateQueued)
 	sp.trxQueue = append(sp.trxQueue, trx)
 }
 
@@ -168,16 +172,33 @@ func (sp *stunPacer) trxExecuteNow(trx *STUNTransaction) {
 	sp.mux.Lock()
 	defer sp.mux.Unlock()
 
+	trx.setState(TrxStateInProgress)
 	sp.trxDispatched[trx.StringId] = trx
 	go trx.transmit()
 }
 
 //this is a hack to avoid direct state update from side effect
-func (sp *stunPacer) trxFailed(trxId string) {
+func (sp *stunPacer) trxUndispatch(trxId string) {
 	sp.mux.Lock()
 	defer sp.mux.Unlock()
 
 	delete(sp.trxDispatched, trxId)
+}
+
+func (sp *stunPacer) trxDequeue(trxId string) {
+	sp.mux.Lock()
+	defer sp.mux.Unlock()
+
+	delete(sp.trxDispatched, trxId)
+
+	for i, trx := range sp.trxQueue {
+		if trx.StringId == trxId {
+			//this is a bit costly: https://stackoverflow.com/questions/37334119/how-to-delete-an-element-from-a-slice-in-golang
+			sp.trxQueue = append(sp.trxQueue[:i], sp.trxQueue[i+1:]...)
+			close(trx.resultChannel) //this notifies the receiver that trx was cancelled
+			return
+		}
+	}
 }
 
 //TODO: maybe build some tree-based queue that would both allow searching on trxId and keeping ordering according to enqueue order

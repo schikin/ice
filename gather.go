@@ -252,7 +252,7 @@ func (g *Gatherer) gatherSingleSrflx(base Base, url *URL, localPreference uint16
 		and the STUN retransmit timer, RTO
 	 */
 
-	stunAddr, err := stunBind(base, addr, stunGatherTimeout)
+	stunAddr, err := sendGatheringBind(base, addr, stunGatherTimeout)
 
 	if err != nil {
 		g.log.Errorf("could not get server reflexive address %s %s: %v\n", network, url, err)

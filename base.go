@@ -25,6 +25,7 @@ type Base interface {
 	Component() *Component
 	Connection() net.PacketConn
 	LocalAddr() net.Addr
+	Equals(other Base) bool
 
 	start() error
 	close() error
@@ -39,6 +40,10 @@ type UdpBase struct {
 	component *Component
 
 	conn vnet.UDPPacketConn
+}
+
+func (u *UdpBase) Equals(other Base) bool {
+	return u.LocalAddr().String() == other.LocalAddr().String() && u.NetworkType().String() == other.NetworkType().String()
 }
 
 func (u *UdpBase) LocalAddr() net.Addr {

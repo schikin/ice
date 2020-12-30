@@ -130,6 +130,48 @@ func (c *checklist) getState() ChecklistState {
 	return c.state
 }
 
+func (c *checklist) pushTriggeredQueue(cp *CandidatePair) {
+	c.mux.Lock()
+	defer c.mux.Unlock()
+
+	for _, pair := range c.triggeredCheckQueue {
+		if pair.Equals(cp) {
+			c.stream.log.Debugf("tried to push pair to triggered queue when it was already there - ignoring: %s", cp)
+			return
+		}
+	}
+
+	c.triggeredCheckQueue = append(c.triggeredCheckQueue, cp)
+}
+
+func (c *checklist) addAndPushToTriggeredQueue(cp *CandidatePair) {
+	c.mux.Lock()
+	defer c.mux.Unlock()
+
+	found := false
+
+	for _, pair := range c.all {
+		if pair.Equals(cp) {
+			c.stream.log.Debugf("tried to push pair when it was already present - ignoring: %s", cp)
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		c.all = append(c.all, cp)
+	}
+
+	for _, pair := range c.triggeredCheckQueue {
+		if pair.Equals(cp) {
+			c.stream.log.Debugf("tried to push pair to triggered queue when it was already there - ignoring: %s", cp)
+			return
+		}
+	}
+
+	c.triggeredCheckQueue = append(c.triggeredCheckQueue, cp)
+}
+
 func (c *checklist) popTriggeredQueue() *CandidatePair {
 	c.mux.Lock()
 	defer c.mux.Unlock()
