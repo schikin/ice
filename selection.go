@@ -1,4 +1,5 @@
 package ice
+
 //
 //import (
 //	"net"
@@ -9,7 +10,7 @@ package ice
 //)
 //
 //type pairCandidateSelector interface {
-//	Start()
+//	Bind()
 //	ContactCandidates()
 //	PingCandidate(local, remote Candidate)
 //	HandleSucessResponse(m *stun.Response, local, remote Candidate, remoteAddr net.Addr)
@@ -24,7 +25,7 @@ package ice
 //	log                    logging.LeveledLogger
 //}
 //
-//func (s *controllingSelector) Start() {
+//func (s *controllingSelector) Bind() {
 //	s.startTime = time.Now()
 //	go func() {
 //		time.Sleep(s.agent.candidateSelectionTimeout)
@@ -196,7 +197,7 @@ package ice
 //	log   logging.LeveledLogger
 //}
 //
-//func (s *controlledSelector) Start() {}
+//func (s *controlledSelector) Bind() {}
 //
 //func (s *controlledSelector) ContactCandidates() {
 //	if s.agent.selectedPair != nil {

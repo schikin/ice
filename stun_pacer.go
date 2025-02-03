@@ -11,34 +11,34 @@ import (
 type stunPacingChangedEvent struct {
 	pacingMs int
 }
-type poisonPill struct {}
+type poisonPill struct{}
 
 type stunPacer struct {
-	agent				*Agent
-	trxQueue			[]*STUNTransaction
-	trxDispatched		map[string]*STUNTransaction
+	agent         *Agent
+	trxQueue      []*STUNTransaction
+	trxDispatched map[string]*STUNTransaction
 
-	pacingMs			int
-	pacingTicker		*time.Ticker
+	pacingMs     int
+	pacingTicker *time.Ticker
 
-	events				EventChannel
-	started				bool
+	events  EventChannel
+	started bool
 
-	log 				logging.LeveledLogger
-	mux					sync.Mutex
+	log logging.LeveledLogger
+	mux sync.Mutex
 }
 
 func newStunPacer(agent *Agent, pacing int) *stunPacer {
 	return &stunPacer{
-		agent:			agent,
-		trxQueue: 		[]*STUNTransaction{},
-		trxDispatched: 	make(map[string]*STUNTransaction),
-		pacingMs:		pacing,
+		agent:         agent,
+		trxQueue:      []*STUNTransaction{},
+		trxDispatched: make(map[string]*STUNTransaction),
+		pacingMs:      pacing,
 
-		events:			make(EventChannel),
-		started:		false,
-		log:			agent.log,
-		mux:			sync.Mutex{},
+		events:  make(EventChannel),
+		started: false,
+		log:     agent.log,
+		mux:     sync.Mutex{},
 	}
 }
 
@@ -84,10 +84,10 @@ func (sp *stunPacer) eventLoop() {
 
 	for {
 		select {
-		case <- sp.pacingTicker.C:
+		case <-sp.pacingTicker.C:
 			sp.onPacing()
 			break
-		case untypedEvt := <- sp.events:
+		case untypedEvt := <-sp.events:
 			switch typedEvt := untypedEvt.(type) {
 			case stunPacingChangedEvent:
 				sp.log.Infof("changing pacing to: %dms", typedEvt.pacingMs)
@@ -126,7 +126,7 @@ func (sp *stunPacer) onPacing() {
 	sp.agent.onPacing()
 }
 
-func (sp *stunPacer) onInboundStun(base Base, message *stun.Message, remote net.Addr) {
+func (sp *stunPacer) onInboundStun(base base, message *stun.Message, remote net.Addr) {
 	trxId := stunEncodeTrxId(message.TransactionID)
 
 	switch message.Type.Class {
@@ -136,7 +136,7 @@ func (sp *stunPacer) onInboundStun(base Base, message *stun.Message, remote net.
 		trx, ok := sp.trxDispatched[trxId]
 
 		if !ok {
-			sp.log.Warnf("received response for non-existent trx: %s->%s, trxId=%s", remote, base.Address(), trxId)
+			sp.log.Warnf("received response for non-existent trx: %s->%s, trxId=%s", remote, base.Connection().LocalAddr(), trxId)
 			sp.mux.Unlock()
 			return
 		}
@@ -156,7 +156,7 @@ func (sp *stunPacer) onInboundStun(base Base, message *stun.Message, remote net.
 		break
 	case stun.ClassIndication, stun.ClassRequest:
 		//maybe run in goroutine for extra safety?
-		base.Component().recvStunRequest(base, remote, message)
+		base.Component().processInboundStunRequest(base, remote, message)
 	}
 }
 

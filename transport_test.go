@@ -1,4 +1,5 @@
 package ice
+
 //
 //import (
 //	"context"
@@ -181,7 +182,7 @@ package ice
 //		var acceptErr error
 //		aConn, acceptErr = aAgent.AcceptSession(context.TODO(), bUfrag, bPwd)
 //		check(acceptErr)
-//		close(accepted)
+//		Close(accepted)
 //	}()
 //
 //	bConn, err := bAgent.Dial(context.TODO(), aUfrag, aPwd)
@@ -379,7 +380,7 @@ package ice
 //	done := make(chan struct{})
 //	return func(state ConnectionState) {
 //		if state == ConnectionStateConnected {
-//			close(done)
+//			Close(done)
 //		}
 //	}, done
 //}

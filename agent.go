@@ -3,10 +3,8 @@
 package ice
 
 import (
-	"fmt"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/pion/logging"
@@ -48,7 +46,7 @@ const (
 	// max binding request before considering a pair failed
 	defaultMaxBindingRequests = 7
 
-	// the number of bytes that can be buffered before we start to error
+	// the number of bytes that can be buffered before we Bind to error
 	maxBufferSize = 1000 * 1000 // 1MB
 
 	// gathering timeout
@@ -61,8 +59,8 @@ const (
 	// by default assume half-trickle for backwards compatibility
 	defaultTrickleMode = TrickleModeHalf
 
-	defaultStandard = ICEStandardRFC8445
-	
+	defaultStandard = StandardRFC8445
+
 	stunGatherTimeout = 5 * time.Second
 )
 
@@ -78,17 +76,7 @@ type bindingRequest struct {
 
 type Credentials struct {
 	UFrag string
-	Pwd string
-}
-
-type LocalSessionRequest struct {
-	Streams []LocalStreamRequest
-}
-
-type RemoteSessionRequest struct {
-	Options            SessionParameters
-	SessionCredentials *Credentials
-	Streams            []RemoteStreamRequest
+	Pwd   string
 }
 
 //compatible with WebRTC states
@@ -130,78 +118,46 @@ const (
 	   	they MUST have identical ice-pwd's.
 */
 
-type LocalStreamRequest struct {
-	ID	string
-
-	StreamCredentials *Credentials //you can choose to have per-stream credentials too
-	TrickleMode *TrickleMode //trickle mode can be set at media-level as well as session-level
-	Components	[]LocalComponentRequest
+type SessionConfiguration struct {
+	Credentials *Credentials
+	TrickleMode *TrickleMode
+	Streams     []StreamConfiguration
 }
 
-type RemoteStreamRequest struct {
-	ID	string
-
-	EndOfCandidates bool
-	Trickle bool
-	StreamCredentials *Credentials
-	Components	[]RemoteComponentRequest
-}
-
-type RemoteComponentRequest struct {
-	ID	uint16
-	Candidates		[]Candidate
-	RelatedComponent *RemoteComponentRequest
-}
-
-type LocalComponentRequest struct {
-	ID	uint16
-	RelatedComponent *LocalComponentRequest //hack for the case of RTP/RTCP mux disabled
-}
-
-type SessionProposal struct {
-	NegotiateParams SessionParameters
-	Streams          map[string]*StreamProposal //candidates by stream. to find out component id you can use field of candidate
-}
-
-type StreamProposal struct {
+type StreamConfiguration struct {
 	ID string
-	Candidates []Candidate
-	Trickle bool
+
+	StreamCredentials *Credentials //you can choose to have per-component credentials too
+	TrickleMode       *TrickleMode //trickle mode can be set at media-level as well as session-level
+	Components        []ComponentConfiguration
 }
 
-type restartPacerEvent struct {
+type ComponentConfiguration struct {
+	ID                 uint16
+	RelatedComponentID uint16 //hack for the case of RTP/RTCP mux disabled
 }
 
-type updatePeerStandard struct {
-	Standard ICEStandard
-}
-
-type deleteStreamEvent struct {
-	Stream *Stream
-}
-
-type remoteCandidateEvent struct {
-	Component *Component
-	Candidate *Candidate
-}
-
-func (a *Agent) eventLoop() {
+func (a *Agent) receiveLoop(b base) {
+	log := a.log
+	buffer := make([]byte, receiveMTU)
 	for {
-		select {
-		case signalEvt := <- a.signalChannel.Events():
-			a.processRemoteSignal(signalEvt)
-		case evt := <- a.events:
-			switch typedEvt := evt.(type) {
-			case poisonPill:
-				a.log.Infof("poison pill received - stopping event loop")
-				return
-			case gathererCandidateEvent:
-				typedEvt.Gatherer.Component.processLocalCandidate(typedEvt.Candidate)
-				break
-			case gathererStateEvent:
-				typedEvt.Gatherer.Component.processGatherState(typedEvt.State)
-				break
-			}
+		n, srcAddr, err := b.Connection().ReadFrom(buffer)
+		if err != nil {
+			log.Errorf("failed to recv, local=%s: %v", b.Connection().LocalAddr(), err)
+			return //TODO trigger some kind of event to report component is dead
+		}
+
+		data := buffer[:n]
+		stunMsg, err := demultiplexSTUN(data)
+
+		if err != nil {
+			log.Warnf("failed to decode STUN from local=%s,remote=%s: %v", b.Connection().LocalAddr(), srcAddr, err)
+		}
+
+		if stunMsg != nil {
+			a.stunPacer.onInboundStun(b, stunMsg, srcAddr)
+		} else {
+			b.Component().receiveData(data)
 		}
 	}
 }
@@ -233,16 +189,6 @@ outerLoop:
 	}
 }
 
-func (a *Agent) start() {
-	a.mux.Lock()
-	defer a.mux.Unlock()
-
-	a.isStarted = true
-
-	a.stunPacer.start()
-	go a.eventLoop()
-}
-
 func (a *Agent) close() {
 	a.mux.Lock()
 	defer a.mux.Unlock()
@@ -251,8 +197,6 @@ func (a *Agent) close() {
 		stream.close()
 	}
 
-	a.isStarted = false
-	a.events <- poisonPill{}
 	a.stunPacer.close()
 }
 
@@ -260,7 +204,7 @@ func (a *Agent) flushRemoteQueue() {
 candLoop:
 	for {
 		select {
-		case candSig := <- a.remoteSignalQueue.candidate:
+		case candSig := <-a.remoteSignalQueue.candidate:
 			stream, ok := a.Streams[candSig.StreamId]
 
 			if !ok {
@@ -279,7 +223,7 @@ candLoop:
 eocLoop:
 	for {
 		select {
-		case eocSig := <- a.remoteSignalQueue.eoc:
+		case eocSig := <-a.remoteSignalQueue.eoc:
 			stream, ok := a.Streams[eocSig.StreamId]
 
 			if !ok {
@@ -310,10 +254,10 @@ func (a *Agent) processRemoteSignal(signalEvt interface{}) {
 	trickling := state == TrickleStateTrickling
 
 	switch typedSignal := signalEvt.(type) {
-	case SignalOffer:
+	case SignalSession:
 		a.remoteSignalQueue.offer <- &typedSignal
 		break
-	case SignalCandidate:
+	case SignalTrickleCandidate:
 		if trickling {
 			stream, ok := a.Streams[typedSignal.StreamId]
 
@@ -327,7 +271,7 @@ func (a *Agent) processRemoteSignal(signalEvt interface{}) {
 		}
 
 		break
-	case SignalEndOfCandidates:
+	case SignalTrickleFinished:
 		if trickling {
 			stream, ok := a.Streams[typedSignal.StreamId]
 
@@ -348,14 +292,13 @@ func (a *Agent) processLocalCandidate(stream *Stream, candidate *LocalCandidate)
 
 	currState := a.localTrickleState
 
-	sig := SignalCandidate{
+	sig := SignalTrickleCandidate{
 		Candidate: candidate.Candidate,
 		StreamId:  stream.ID,
 	}
 
 	if currState == TrickleStateTrickling {
-		//TODO: create additional event loop for side effect serialization - otherwise EOC might be emitted before all candidates are conveyed which is against standard
-		go a.signalChannel.SendCandidate(sig)
+		_ = a.signalHandler.HandleTrickleCandidate(sig)
 	} else if currState == TrickleStateFinished {
 		a.log.Debugf("received local candidate: %s after trickling is finished - ignoring", candidate.Candidate)
 	} else {
@@ -405,9 +348,9 @@ func (a *Agent) onPacing() {
 		but on the other hand it says that RFC5245 logic for connectivity checks should be followed. this is contradictory:
 		in trickle both gathering transactions and connectivity transactions can occur at the same time
 		if we try to strictly follow the pacing requirements - it kills the idea behind trickle of reducing the connection setup time -
-		if we want to stick with strict queueing and execution of transactions then connectivity checks will never start
+		if we want to stick with strict queueing and execution of transactions then connectivity checks will never Bind
 		before the gathering transactions are dispatched as gathering transactions are enqueued before the connectivity checks
-		this would render ICE TRICKLE to always work in a mode similar to TRICKLE-NONE (checks only start after all candidates have been gathered)
+		this would render ICE TRICKLE to always work in a mode similar to TRICKLE-NONE (checks only Bind after all candidates have been gathered)
 
 		also, global 5ms pacing restriction is not followed here as rationale for 5ms pacing doesn't really apply to us:
 		link to pacing rationale: https://tools.ietf.org/html/rfc8445#appendix-B.1
@@ -421,7 +364,7 @@ func (a *Agent) onPacing() {
 
 		!thus, we relax the pacing restriction here in order to reduce the connection time
 
-	 */
+	*/
 	if connecting {
 		/* https://tools.ietf.org/html/draft-ietf-ice-trickle-21#section-8
 
@@ -433,7 +376,7 @@ func (a *Agent) onPacing() {
 		   After that, the check list state is set according to the procedures
 		   in [rfc5245bis].
 
-		 */
+		*/
 
 		if localTrickleState == TrickleStateFinished && remoteTrickleState == TrickleStateFinished {
 			a.rfc8445ConnectivityLogic()
@@ -453,7 +396,7 @@ func (a *Agent) trickleConnectivityLogic() {
 	for i := 0; i <= n; i++ {
 		idx := a.streamsLoopCounter
 
-		a.streamsLoopCounter = ( a.streamsLoopCounter + 1 ) % n
+		a.streamsLoopCounter = (a.streamsLoopCounter + 1) % n
 
 		stream := a.streamsOrdered[idx]
 
@@ -476,13 +419,13 @@ func (a *Agent) trickleConnectivityLogic() {
 		}
 
 		/*
-				3.  If there are one or more candidate pairs in the Waiting state,
-		       	the agent picks the highest-priority candidate pair (if there are
-		       	multiple pairs with the same priority, the pair with the lowest
-		       	component ID is picked) in the Waiting state, performs a
-		       	connectivity check on that pair, puts the candidate pair state to
-		       	In-Progress, and aborts the subsequent steps.
-		 */
+					3.  If there are one or more candidate pairs in the Waiting state,
+			       	the agent picks the highest-priority candidate pair (if there are
+			       	multiple pairs with the same priority, the pair with the lowest
+			       	component ID is picked) in the Waiting state, performs a
+			       	connectivity check on that pair, puts the candidate pair state to
+			       	In-Progress, and aborts the subsequent steps.
+		*/
 
 		if len(waitList) > 0 {
 			var maxPriority uint64
@@ -511,14 +454,14 @@ func (a *Agent) trickleConnectivityLogic() {
 		}
 
 		/*
-			   2.  If there is no candidate pair in the Waiting state, and if there
-		       are one or more pairs in the Frozen state, the agent checks the
-		       foundation associated with each pair in the Frozen state.  For a
-		       given foundation, if there is no pair (in any checklist in the
-		       checklist set) in the Waiting or In-Progress state, the agent
-		       puts the candidate pair state to Waiting and continues with the
-		       next step.
-		 */
+				   2.  If there is no candidate pair in the Waiting state, and if there
+			       are one or more pairs in the Frozen state, the agent checks the
+			       foundation associated with each pair in the Frozen state.  For a
+			       given foundation, if there is no pair (in any checklist in the
+			       checklist set) in the Waiting or In-Progress state, the agent
+			       puts the candidate pair state to Waiting and continues with the
+			       next step.
+		*/
 
 		if len(frozenList) > 0 {
 			for _, pair := range frozenList {
@@ -550,65 +493,62 @@ func (a *Agent) trickleConnectivityLogic() {
 
 // Agent represents the ICE agent
 type Agent struct {
-	Config  			AgentConfig
+	Config AgentConfig
 
-	Streams 			map[string]*Stream
-	streamsOrdered		map[int]*Stream
+	Streams        map[string]*Stream
+	streamsOrdered map[int]*Stream
 	//to control ordered execution of checks
-	streamsLoopCounter 	int
+	streamsLoopCounter int
 
-	tieBreaker      	uint64
-	connectionState 	ConnectionState
+	tieBreaker      uint64
+	connectionState ConnectionState
 
-	mDNS				*MulticastDNSHelper
+	mDNS *MulticastDNSHelper
 
-	isControlling 		bool
-	isStarted			bool
+	isControlling bool
+	isStarted     bool
 
-	pairFoundationIdx	map[string][]*CandidatePair
+	pairFoundationIdx map[string][]*CandidatePair
 
-	localCredentials 	Credentials
-	remoteCredentials 	*Credentials
+	localCredentials  Credentials
+	remoteCredentials *Credentials
 
-	localStandard  		ICEStandard
-	remoteStandard 		ICEStandard
+	localStandard  Standard
+	remoteStandard Standard
 
-	networkTypes 		[]NetworkType
+	networkTypes []NetworkType
 
-	defaultTrickleMode 	TrickleMode
+	defaultTrickleMode TrickleMode
 
-	loggerFactory 		logging.LoggerFactory
-	log           		logging.LeveledLogger
+	loggerFactory logging.LoggerFactory
+	log           logging.LeveledLogger
 
-	stunPacer			*stunPacer
-	stunConfig 	  		STUNConfig
-	turnConfig	  		TURNConfig
+	stunPacer  *stunPacer
+	stunConfig STUNConfig
+	turnConfig TURNConfig
 
-	localGatherState 	GatheringState
-	remoteGatherState 	GatheringState
+	localGatherState  GatheringState
+	remoteGatherState GatheringState
 
-	signalChannel		SignalChannel
+	signalHandler SignalHandler
 
 	//before the initial proposal is generated
-	localTrickleState 	TrickleState
-	remoteTrickleState	TrickleState
+	localTrickleState  TrickleState
+	remoteTrickleState TrickleState
 
 	foundationGenerator *foundationGenerator
 
-	events	  			EventChannel
+	events EventChannel
 
-	localSignalQueue			*signalQueue
-	remoteSignalQueue			*signalQueue
-
-	onGatherStateCallback 		*func(state GatheringState)
-	onCandidateCallback 		*func(candidate Candidate)
-	onConnectionStateCallback 	*func(state ConnectionState)
+	onGatherStateCallback     *func(state GatheringState)
+	onCandidateCallback       *func(candidate Candidate)
+	onConnectionStateCallback *func(state ConnectionState)
 
 	//used to report results in dial/accept procedures
-	connResultChannel	chan interface{}
+	connResultChannel chan interface{}
 
-	mux					sync.Mutex
-	net 				*vnet.Net
+	mux sync.Mutex
+	net *vnet.Net
 }
 
 func (a *Agent) processPair(pair *CandidatePair) {
@@ -625,7 +565,7 @@ func (a *Agent) processPair(pair *CandidatePair) {
 	a.pairFoundationIdx[foundation] = append(list, pair)
 }
 
-func (a* Agent) dispatchEvent(evt Event) {
+func (a *Agent) dispatchEvent(evt Event) {
 	a.events <- evt
 }
 
@@ -633,14 +573,14 @@ func (a* Agent) dispatchEvent(evt Event) {
 
    resolves role conflict and returns the stun message
 */
-func (a* Agent) resolveRoleConflict(remoteControlAttribute AttrControl) (bool, stun.Setter) {
+func (a *Agent) resolveRoleConflict(remoteControlAttribute AttrControl) (bool, stun.Setter) {
 	a.mux.Lock()
 	defer a.mux.Unlock()
 
 	remoteTieBreaker := remoteControlAttribute.Tiebreaker
 
 	switch remoteControlAttribute.Role {
-	case Controlling:
+	case RoleControlling:
 		if a.isControlling {
 			if a.tieBreaker >= remoteTieBreaker {
 				a.log.Infof("agent will insist on being controlling due to tiebreaker")
@@ -652,14 +592,14 @@ func (a* Agent) resolveRoleConflict(remoteControlAttribute AttrControl) (bool, s
 
 				a.recalculatePairPriorities()
 
-				return true, AttrControl {
-					Role: Controlled,
+				return true, AttrControl{
+					Role:       RoleControlled,
 					Tiebreaker: a.tieBreaker,
 				}
 			}
 		}
 		break
-	case Controlled:
+	case RoleControlled:
 		if !a.isControlling {
 			if a.tieBreaker >= remoteTieBreaker {
 				a.log.Infof("agent is switching to controlling mode due to tiebreaker")
@@ -667,8 +607,8 @@ func (a* Agent) resolveRoleConflict(remoteControlAttribute AttrControl) (bool, s
 
 				a.recalculatePairPriorities()
 
-				return true, AttrControl {
-					Role: Controlling,
+				return true, AttrControl{
+					Role:       RoleControlling,
 					Tiebreaker: a.tieBreaker,
 				}
 			} else {
@@ -732,7 +672,7 @@ func (a *Agent) processRemoteCandidate(candidate *Candidate) {
 	}
 }
 
-func (a *Agent) negotiateStandard(peerOptions []ICEOption) bool {
+func (a *Agent) negotiateStandard(peerOptions []Option) bool {
 	a.mux.Lock()
 	defer a.mux.Unlock()
 
@@ -742,14 +682,14 @@ func (a *Agent) negotiateStandard(peerOptions []ICEOption) bool {
 		switch opt {
 		case ICEOptionICE2:
 			a.log.Debugf("peer confirmed RFC8455 support. VERY NICE! GREAT SUCCESS!")
-			a.remoteStandard = ICEStandardRFC8445
+			a.remoteStandard = StandardRFC8445
 			peerConfirmed8445 = true
 		}
 	}
 
 	if !peerConfirmed8445 {
 		a.log.Warnf("peer did not confirm RFC8445 support - we will try to run in compatibility mode")
-		a.remoteStandard = ICEStandardRFC5245
+		a.remoteStandard = StandardRFC5245
 	}
 
 	return peerConfirmed8445
@@ -769,9 +709,9 @@ func (a *Agent) startLocalOffer() {
 
 //this has to be run within blocking context to avoid race conditions with losing/duplicating candidates
 func (a *Agent) generateOffer() {
-	streamsProps := []RemoteStreamRequest{}
+	streamsProps := []SignalStreamRequest{}
 
-	var iceMode ICEMode
+	var iceMode Mode
 	iceMode = ICEModeFull
 
 	currPacing := a.stunPacer.getPacing()
@@ -779,10 +719,10 @@ func (a *Agent) generateOffer() {
 	opts := SessionParameters{
 		Pacing:  &currPacing,
 		Mode:    &iceMode,
-		Options: []ICEOption{},
+		Options: []Option{},
 	}
 
-	if a.localStandard == ICEStandardRFC8445 {
+	if a.localStandard == StandardRFC8445 {
 		opts.Options = append(opts.Options, ICEOptionICE2)
 	}
 
@@ -794,16 +734,16 @@ func (a *Agent) generateOffer() {
 	}
 
 	for streamId, stream := range a.Streams {
-		streamProp := &RemoteStreamRequest{
+		streamProp := &SignalStreamRequest{
 			ID:                streamId,
 			Trickle:           stream.localTrickleMode == TrickleModeFull || stream.localTrickleMode == TrickleModeHalf,
 			StreamCredentials: stream.localCredentials,
 			EndOfCandidates:   false,
-			Components:        []RemoteComponentRequest{},
+			Components:        []SignalComponentRequest{},
 		}
 
 		for compId, _ := range stream.Components {
-			compProp := RemoteComponentRequest{
+			compProp := SignalComponentRequest{
 				ID:               compId,
 				Candidates:       nil,
 				RelatedComponent: nil,
@@ -825,9 +765,8 @@ func (a *Agent) generateOffer() {
 			}
 		}
 
-		streamsProps = append(streamsProps, *streamProp);
+		streamsProps = append(streamsProps, *streamProp)
 	}
-
 
 	res := &RemoteSessionRequest{
 		Options:            opts,
@@ -836,7 +775,7 @@ func (a *Agent) generateOffer() {
 	}
 
 	a.localTrickleState = TrickleStateOfferReady
-	a.localSignalQueue.offer <- &SignalOffer{Request: *res}
+	a.localSignalQueue.offer <- &SignalSession{Request: *res}
 }
 
 func (a *Agent) processRemoteTrickleState(stream *Stream, state TrickleState) {

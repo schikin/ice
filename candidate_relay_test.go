@@ -1,4 +1,5 @@
 package ice
+
 //
 //import (
 //	"net"
@@ -50,7 +51,7 @@ package ice
 //		CandidateTypes: []CandidateType{CandidateTypeRelay},
 //	}
 //
-//	err = server.Start()
+//	err = server.Bind()
 //	if err != nil {
 //		t.Fatal(err)
 //	}

@@ -4,47 +4,36 @@ import (
 	"fmt"
 )
 
-type ICERole int
+type Option int
 
 const (
-	// StreamStateNew This agent is controlling
-	ICERoleControlling = iota + 1
+	// OptionICE2 ICE2
+	OptionICE2 = iota + 1
 
-	// ICERoleControlled This agent is controlled
-	ICERoleControlled
-)
-
-type ICEOption int
-
-const (
-	// StreamStateNew ICE2
-	ICEOptionICE2 = iota + 1
-
-	// ICEOptionRTPECN RFC6679
-	ICEOptionRTPECN
+	// OptionRTPECN RFC6679
+	OptionRTPECN
 )
 
 type SessionParameters struct {
-	Pacing *int
-	Mode *ICEMode
-	Options []ICEOption
+	Pacing  *int
+	Mode    *Mode
+	Options []Option
 }
 
 type MulticastDNSParams struct {
-	Mode	MulticastDNSMode
-	Name	string
+	Mode MulticastDNSMode
+	Name string
 }
 
-// Role represents ICE agent role, which can be controlling or controlled.
-type Role byte
+type Role int
 
 // UnmarshalText implements TextUnmarshaler.
 func (r *Role) UnmarshalText(text []byte) error {
 	switch string(text) {
 	case "controlling":
-		*r = Controlling
+		*r = RoleControlling
 	case "controlled":
-		*r = Controlled
+		*r = RoleControlled
 	default:
 		return fmt.Errorf("unknown role %q", text)
 	}
@@ -52,15 +41,15 @@ func (r *Role) UnmarshalText(text []byte) error {
 }
 
 // MarshalText implements TextMarshaler.
-func (r Role) MarshalText() (text []byte, err error) {
+func (r *Role) MarshalText() (text []byte, err error) {
 	return []byte(r.String()), nil
 }
 
-func (r Role) String() string {
-	switch r {
-	case Controlling:
+func (r *Role) String() string {
+	switch *r {
+	case RoleControlling:
 		return "controlling"
-	case Controlled:
+	case RoleControlled:
 		return "controlled"
 	default:
 		return "unknown"
@@ -69,36 +58,35 @@ func (r Role) String() string {
 
 // Possible ICE agent roles.
 const (
-	Controlling Role = iota
-	Controlled
+	RoleControlling Role = iota
+	RoleControlled
 )
 
-type ICEStandard int
+type Standard int
 
 const (
-	ICEStandardRFC8445 ICEStandard = iota + 1
-	ICEStandardRFC5245
+	StandardRFC8445 Standard = iota + 1
+	StandardRFC5245
 )
 
-func (s ICEStandard) String() string {
+func (s Standard) String() string {
 	switch s {
-	case ICEStandardRFC8445:
+	case StandardRFC8445:
 		return "RFC8445"
-	case ICEStandardRFC5245:
+	case StandardRFC5245:
 		return "RFC5245"
 	default:
 		return "unknown"
 	}
 }
 
-type ICEMode int
+type Mode int
 
 // List of supported modes
 const (
-	// ICEModeFull ICE Full
-	ICEModeFull = iota + 1
+	// ModeFull ICE Full
+	ModeFull = iota + 1
 
-	// ICEModeLite ICE Lite
-	ICEModeLite
+	// ModeLite ICE Lite
+	ModeLite
 )
-

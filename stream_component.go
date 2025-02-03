@@ -10,49 +10,23 @@ import (
 	"sync"
 )
 
-//TODO: side effects serialization/controlled execution
-
-type componentEvent struct {
-	Component *Component
-}
-
-type componentStateEvent struct {
-	componentEvent
-	State ConnectionState
-}
-
-type componentGatheringEvent struct {
-	componentEvent
-	State GatheringState
-}
-
-type componentLocalCandidateEvent struct {
-	componentEvent
-	Candidate Candidate
-}
-
-type componentPeerCandidateEvent struct {
-	componentEvent
-	Candidate Candidate
-}
-
 type Component struct {
-	ID			   uint16
+	ID uint16
 
-	Stream         *Stream
+	Stream *Stream
 
 	state          ConnectionState
 	gatheringState GatheringState
 
-	gatherer		*Gatherer
+	gatherer *Gatherer
 
-	localCandidates []*LocalCandidate
+	localCandidates  []*LocalCandidate
 	remoteCandidates []Candidate
 
 	data *packetio.Buffer
 
-	log 	logging.LeveledLogger
-	mux		sync.Mutex
+	log logging.LeveledLogger
+	mux sync.Mutex
 }
 
 func newGathererForComponent(component *Component) (*Gatherer, error) {
@@ -62,7 +36,7 @@ func newGathererForComponent(component *Component) (*Gatherer, error) {
 		VNet:           nil,
 		Logger:         stream.log,
 		LoggerFactory:  nil,
-		Component: 		component,
+		Component:      component,
 		STUN:           stream.Agent.stunConfig,
 		TURN:           stream.Agent.turnConfig,
 		NetworkTypes:   stream.Agent.networkTypes,
@@ -73,7 +47,7 @@ func newGathererForComponent(component *Component) (*Gatherer, error) {
 }
 
 //TODO: related (RTP/RTCP) component handling
-func newComponentLocal(stream *Stream, request LocalComponentRequest) (*Component, error){
+func newComponentLocal(stream *Stream, request ComponentConfiguration) (*Component, error) {
 	ret := &Component{
 		ID:             request.ID,
 		Stream:         stream,
@@ -84,7 +58,7 @@ func newComponentLocal(stream *Stream, request LocalComponentRequest) (*Componen
 		remoteCandidates: []Candidate{},
 		data:             packetio.NewBuffer(),
 		log:              stream.log,
-		mux:			  sync.Mutex{},
+		mux:              sync.Mutex{},
 	}
 
 	gatherer, err := newGathererForComponent(ret)
@@ -98,7 +72,7 @@ func newComponentLocal(stream *Stream, request LocalComponentRequest) (*Componen
 	return ret, nil
 }
 
-func newComponentRemote(stream *Stream, request RemoteComponentRequest) (*Component, error){
+func newComponentRemote(stream *Stream, request SignalComponentRequest) (*Component, error) {
 	ret := &Component{
 		ID:             request.ID,
 		Stream:         stream,
@@ -109,7 +83,7 @@ func newComponentRemote(stream *Stream, request RemoteComponentRequest) (*Compon
 		remoteCandidates: request.Candidates,
 		data:             packetio.NewBuffer(),
 		log:              stream.log,
-		mux:			  sync.Mutex{},
+		mux:              sync.Mutex{},
 	}
 
 	gatherer, err := newGathererForComponent(ret)
@@ -127,7 +101,7 @@ func (c *Component) gather() {
 	c.gatherer.Start()
 }
 
-func (c *Component) acceptResponse(response RemoteComponentRequest) error {
+func (c *Component) acceptResponse(response SignalComponentRequest) error {
 	c.mux.Lock()
 	defer c.mux.Unlock()
 
@@ -166,17 +140,7 @@ func (c *Component) setState(state ConnectionState) {
 	c.mux.Lock()
 	defer c.mux.Unlock()
 
-	c.log.Debugf("component state: %s -> %s", c.state, state);
-
 	c.state = state
-	c.dispatchEvent(componentStateEvent{
-		componentEvent: componentEvent{c},
-		State:         state,
-	})
-}
-
-func (c *Component) dispatchEvent(evt Event) {
-	c.Stream.dispatchEvent(evt)
 }
 
 //func (c *Component) eventLoop() {
@@ -215,7 +179,7 @@ func (c *Component) dispatchEvent(evt Event) {
 //	}
 //}
 
-func resolveRemoteAddr(remote net.Addr) (net.IP, int, error) {
+func resolveNetAddr(remote net.Addr) (net.IP, int, error) {
 	switch addr := remote.(type) {
 	case *net.UDPAddr:
 		return addr.IP, addr.Port, nil
@@ -227,7 +191,7 @@ func resolveRemoteAddr(remote net.Addr) (net.IP, int, error) {
 }
 
 func (c *Component) buildBindingResponse(remote net.Addr, message *stun.Message) (*stun.Message, error) {
-	ip, port, err := resolveRemoteAddr(remote)
+	ip, port, err := resolveNetAddr(remote)
 
 	if err != nil {
 		return nil, fmt.Errorf("STUN request processing internal failure: %v", err)
@@ -252,34 +216,36 @@ func (c *Component) buildBindingResponse(remote net.Addr, message *stun.Message)
 	address as described in Section 7.3.1.2).  The agent has sufficient
 	information at this point to generate the response;
 
- */
-func (c *Component) respondBindingEarly(base Base, remote net.Addr, message *stun.Message) {
+*/
+func (c *Component) respondBindingEarly(base base, remote net.Addr, message *stun.Message) error {
 	out, err := c.buildBindingResponse(remote, message)
 
 	if err != nil {
-		c.log.Warnf("failed to handle inbound STUN from: %s to: %s error: %s", remote, base.Address(), err)
-		return
+		c.log.Warnf("failed to handle inbound STUN from: %s to: %s error: %s", remote, base.Connection().LocalAddr(), err)
+		return err
 	}
 
-	c.sendStun(base, remote, out)
+	return c.sendStun(base, remote, out)
 }
 
-func (c *Component) sendStun(base Base, remote net.Addr, message *stun.Message) {
+func (c *Component) sendStun(base base, remote net.Addr, message *stun.Message) error {
 	message.Encode()
-	go base.write(message.Raw, remote)
+	_, err := base.Connection().WriteTo(message.Raw, remote)
+
+	return err
 }
 
 /*
 	https://tools.ietf.org/html/rfc8445#section-7.3.1.3
 
 	follows full procedure for inbound request processing
- */
-func (c *Component) respondBindingFull(base Base, remote net.Addr, message *stun.Message) {
+*/
+func (c *Component) respondBindingFull(base base, remote net.Addr, message *stun.Message) error {
 	response, err := c.buildBindingResponse(remote, message)
 
 	if err != nil {
-		c.log.Warnf("failed to handle inbound STUN from: %s to: %s error: %s", remote, base.Address(), err)
-		return
+		c.log.Warnf("failed to handle inbound STUN from: %s to: %s error: %s", remote, base.Connection().LocalAddr(), err)
+		return err
 	}
 
 	prflxCandidate, err := c.discoverPeerReflexive(base, remote, message)
@@ -293,7 +259,7 @@ func (c *Component) respondBindingFull(base Base, remote net.Addr, message *stun
 	if err != nil {
 		c.log.Errorf("failed to generate triggered check - responding with error: %v", err)
 		c.sendBindingError(base, remote, message, stun.CodeServerError, "Internal error while generating triggered check")
-		return
+		return err
 	}
 
 	err = c.checkNominatedFlag(message, pair)
@@ -301,10 +267,10 @@ func (c *Component) respondBindingFull(base Base, remote net.Addr, message *stun
 	if err != nil {
 		c.log.Errorf("nomination flag check failed - responding with error: %v", err)
 		c.sendBindingError(base, remote, message, stun.CodeBadRequest, "Illegal usage of ")
-		return
+		return err
 	}
 
-	c.sendStun(base, remote, response)
+	return c.sendStun(base, remote, response)
 }
 
 /*
@@ -330,18 +296,20 @@ func (c *Component) respondBindingFull(base Base, remote net.Addr, message *stun
    This candidate is added to the list of remote candidates.  However,
    the ICE agent does not pair this candidate with any local candidates.
 */
-func (c *Component) discoverPeerReflexive(base Base, remote net.Addr, message *stun.Message) (*Candidate, error) {
-	ip, port, err := resolveRemoteAddr(remote)
+func (c *Component) discoverPeerReflexive(base base, remote net.Addr, message *stun.Message) (*Candidate, error) {
+	remoteIp, remotePort, err := resolveNetAddr(remote)
 
 	if err != nil {
 		return nil, err
 	}
 
+	localIp, localPort, _ := resolveNetAddr(base.Connection().LocalAddr())
+
 	remoteCandidates := c.Stream.checklist.getRemoteCandidates()
 
-	for _, cand := range remoteCandidates {
-		if cand.TransportHost == ip.String() && cand.TransportPort == port {
-			c.log.Debugf("found matching candidate for inbound request: %s - no peer reflexive candidate will be created", cand.String())
+	for _, candidate := range remoteCandidates {
+		if candidate.TransportHost == remoteIp.String() && candidate.TransportPort == remotePort {
+			c.log.Debugf("found matching candidate for inbound request: %s - no peer reflexive candidate will be created", candidate.String())
 			return nil, nil
 		}
 	}
@@ -357,15 +325,15 @@ func (c *Component) discoverPeerReflexive(base Base, remote net.Addr, message *s
 	network := base.NetworkType().NetworkShort()
 
 	cb := &Candidate{
-		Foundation:    c.Stream.Agent.foundationGenerator.generate(network, base.IP(), &ip, CandidateTypePeerReflexive), //this is a bit non-conforming to standard but much easier to implement
+		Foundation:    c.Stream.Agent.foundationGenerator.generate(network, &localIp, &remoteIp, CandidateTypePeerReflexive), //this is a bit non-conforming to standard but much easier to implement
 		ComponentId:   c.ID,
 		Transport:     network,
-		TransportHost: ip.String(),
-		TransportPort: port,
+		TransportHost: remoteIp.String(),
+		TransportPort: remotePort,
 		Priority:      priority,
 		Type:          CandidateTypePeerReflexive,
-		RelatedHost:   base.IP().String(),
-		RelatedPort:   base.Port(),
+		RelatedHost:   localIp.String(),
+		RelatedPort:   localPort,
 	}
 
 	c.Stream.checklist.processPeerReflexiveCandidate(cb)
@@ -376,9 +344,9 @@ func (c *Component) discoverPeerReflexive(base Base, remote net.Addr, message *s
 /*
 	https://tools.ietf.org/html/rfc8445#section-7.3.1.4
 	7.3.1.4.  Triggered Checks
- */
-func (c *Component) generateTriggeredCheck(base Base, remote net.Addr, prflxCandidate *Candidate) (*CandidatePair, error) {
-	existingPair := c.Stream.checklist.lookupPair(base.LocalAddr(), remote)
+*/
+func (c *Component) generateTriggeredCheck(base base, remote net.Addr, prflxCandidate *Candidate) (*CandidatePair, error) {
+	existingPair := c.Stream.checklist.lookupPair(base.Connection().LocalAddr(), remote)
 
 	if existingPair != nil {
 		c.log.Debugf("found existing pair for the transport address - no prflx pair will be created: %s", existingPair.String())
@@ -439,26 +407,24 @@ func (c *Component) generateTriggeredCheck(base Base, remote net.Addr, prflxCand
 /*
 	https://tools.ietf.org/html/rfc8445#section-7.3.1.5
 	7.3.1.5.  Updating the Nominated Flag
- */
+*/
 func (c *Component) checkNominatedFlag(message *stun.Message, pair *CandidatePair) error {
-
-	
 
 	return nil
 }
 
-func (c *Component) sendBindingError(base Base, remote net.Addr, message *stun.Message, code stun.ErrorCode, reason string) {
+func (c *Component) sendBindingError(base base, remote net.Addr, message *stun.Message, code stun.ErrorCode, reason string) error {
 	errMessage, err := stun.Build(message, stun.BindingError, stun.ErrorCodeAttribute{Code: code, Reason: []byte(reason)})
 
 	if err != nil {
 		c.log.Errorf("failed to build STUN error response: %v", err)
-		return
+		return err
 	}
 
-	c.sendStun(base, remote, errMessage)
+	return c.sendStun(base, remote, errMessage)
 }
 
-func (c *Component) recvStunRequest(base Base, remote net.Addr, message *stun.Message) {
+func (c *Component) processInboundStunRequest(base base, remote net.Addr, message *stun.Message) error {
 	c.log.Debugf("STUN request recv: %s", message)
 
 	attrControl := AttrControl{}
@@ -467,46 +433,45 @@ func (c *Component) recvStunRequest(base Base, remote net.Addr, message *stun.Me
 
 	if err == nil {
 		c.log.Errorf("no ICE-CONTROL attribute in stun request")
-		return
+		return err
 	}
 
 	ok, controlAttribute := c.Stream.Agent.resolveRoleConflict(attrControl)
 
 	if !ok {
-		errMessage, err := stun.Build(stun.BindingError,controlAttribute)
+		errMessage, err := stun.Build(stun.BindingError, controlAttribute)
 
 		if err != nil {
 			c.log.Errorf("failed to build STUN error response: %v", err)
-			return
+			return err
 		}
 
-		c.sendStun(base, remote, errMessage)
+		err = c.sendStun(base, remote, errMessage)
 
 		c.log.Debugf("interrupting further processing due to the role conflict detected")
-		return
+		return err
 	}
 
 	response, err := stun.Build(message, controlAttribute)
 
 	if err != nil {
 		c.log.Errorf("failed to build STUN response: %v", err)
-		return
+		return err
 	}
 
 	if c.Stream.getRemoteCredentials() == nil {
-		c.respondBindingEarly(base, remote, response)
+		return c.respondBindingEarly(base, remote, response)
 	} else {
 		//validate the credentials
-		credsErr := c.validateRemoteCredentials(message)
+		credentialsErr := c.validateRemoteCredentials(message)
 
-		if credsErr != nil {
-			c.log.Infof("invalid credentials - dropping inbound STUN request: %v", credsErr)
+		if credentialsErr != nil {
+			c.log.Infof("invalid credentials - dropping inbound STUN request: %v", credentialsErr)
 
-			c.sendBindingError(base, remote, message, stun.CodeUnauthorized, "Integrity check failed")
-			return
+			return c.sendBindingError(base, remote, message, stun.CodeUnauthorized, "Integrity check failed")
 		}
 
-		c.respondBindingFull(base, remote, response)
+		return c.respondBindingFull(base, remote, response)
 	}
 
 }
@@ -541,17 +506,21 @@ func (c *Component) validateRemoteCredentials(message *stun.Message) error {
 	return integrity.Check(message)
 }
 
-func (c *Component) recvData(base Base, remote net.Addr, buffer []byte) {
+func (c *Component) receiveData(buffer []byte) {
 	//if !c.validatePeerAddr(candidate, addr) {
 	//	c.log.Warnf("received data failed remote addr validation for candidate %s", candidate)
 	//	return
 	//}
-	c.log.Debugf("data package recv, size=%d", len(buffer))
+	_, err := c.data.Write(buffer)
+
+	if err != nil {
+		c.log.Debugf("failed to receive data: %v", err)
+	}
 }
 
 func (c *Component) close() {
 	for _, lc := range c.localCandidates {
-		lc.base.close()
+		_ = lc.base.Connection().Close()
 	}
 }
 

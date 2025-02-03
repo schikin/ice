@@ -41,7 +41,7 @@ func (c ChecklistState) String() string {
 
 type candidatePairPriorityQueue struct {
 	data []*CandidatePair
-	idx map[*CandidatePair]int
+	idx  map[*CandidatePair]int
 }
 
 func (pq candidatePairPriorityQueue) Len() int { return len(pq.data) }
@@ -69,7 +69,7 @@ func (pq *candidatePairPriorityQueue) Pop() interface{} {
 	old := pq.data
 	n := len(old)
 	item := old[n-1]
-	old[n-1] = nil  // avoid memory leak
+	old[n-1] = nil // avoid memory leak
 	pq.idx[item] = -1
 	pq.data = old[0 : n-1]
 	return item
@@ -86,25 +86,25 @@ func (pq *candidatePairPriorityQueue) Remove(cp *CandidatePair) {
 }
 
 type checklist struct {
-	localCandidates []*LocalCandidate
+	localCandidates  []*LocalCandidate
 	remoteCandidates []*Candidate
 
-	stream *Stream
-	all []*CandidatePair
+	stream              *Stream
+	all                 []*CandidatePair
 	triggeredCheckQueue []*CandidatePair
 
 	state ChecklistState
-	mux sync.Mutex
+	mux   sync.Mutex
 }
 
 func (c *checklist) lookupPair(localAddr net.Addr, remoteAddr net.Addr) *CandidatePair {
-	localIp, localPort, err := resolveRemoteAddr(localAddr)
+	localIp, localPort, err := resolveNetAddr(localAddr)
 
 	if err != nil {
 		return nil
 	}
 
-	remoteIp, remotePort, err := resolveRemoteAddr(remoteAddr)
+	remoteIp, remotePort, err := resolveNetAddr(remoteAddr)
 
 	if err != nil {
 		return nil
@@ -112,7 +112,7 @@ func (c *checklist) lookupPair(localAddr net.Addr, remoteAddr net.Addr) *Candida
 
 	//TODO: fix linear search at some point
 	for _, pair := range c.all {
-		if 	pair.local.TransportHost == localIp.String() &&
+		if pair.local.TransportHost == localIp.String() &&
 			pair.local.TransportPort == localPort &&
 			pair.remote.TransportHost == remoteIp.String() &&
 			pair.remote.TransportPort == remotePort {

@@ -26,11 +26,11 @@ const (
 )
 
 type MulticastDNSHelper struct {
-	conn	*mdns.Conn
+	conn *mdns.Conn
 
-	log     logging.LeveledLogger
-	Mode	MulticastDNSMode
-	Name    string
+	log  logging.LeveledLogger
+	Mode MulticastDNSMode
+	Name string
 }
 
 func NewMulticastDNSHelper(parameters AgentConfig, lf logging.LoggerFactory) *MulticastDNSHelper {
@@ -53,7 +53,7 @@ func NewMulticastDNSHelper(parameters AgentConfig, lf logging.LoggerFactory) *Mu
 	ret := &MulticastDNSHelper{
 		conn: nil,
 
-		log: log,
+		log:  log,
 		Mode: mDNSMode,
 		Name: mDNSName,
 	}
@@ -77,7 +77,7 @@ func (m *MulticastDNSHelper) Start() {
 
 	l, mdnsErr := net.ListenUDP("udp4", addr)
 	if mdnsErr != nil {
-		// If ICE fails to start MulticastDNS server just warn the user and continue
+		// If ICE fails to Bind MulticastDNS server just warn the user and continue
 		m.log.Errorf("Failed to enable mDNS, continuing in mDNS disabled mode: (%s)", mdnsErr)
 		m.Mode = MulticastDNSModeDisabled
 		return
@@ -88,7 +88,7 @@ func (m *MulticastDNSHelper) Start() {
 		conn, err := mdns.Server(ipv4.NewPacketConn(l), &mdns.Config{})
 
 		if err != nil {
-			m.log.Errorf("Failed to start mDNS server in resolve-only mode, continuing in mDNS disabled mode: (%s)", mdnsErr)
+			m.log.Errorf("Failed to Bind mDNS server in resolve-only mode, continuing in mDNS disabled mode: (%s)", mdnsErr)
 			m.Mode = MulticastDNSModeDisabled
 			return
 		}
@@ -102,7 +102,7 @@ func (m *MulticastDNSHelper) Start() {
 		})
 
 		if err != nil {
-			m.log.Errorf("Failed to start mDNS server in resolve and serve mode, continuing in mDNS disabled mode: (%s)", mdnsErr)
+			m.log.Errorf("Failed to Bind mDNS server in resolve and serve mode, continuing in mDNS disabled mode: (%s)", mdnsErr)
 			m.Mode = MulticastDNSModeDisabled
 			return
 		}

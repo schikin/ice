@@ -1,4 +1,5 @@
 package ice
+
 //
 //import (
 //	"net"
@@ -63,8 +64,8 @@ package ice
 //	}, nil
 //}
 //
-//func (c *CandidateRelay) close() error {
-//	err := c.candidateBase.close()
+//func (c *CandidateRelay) Close() error {
+//	err := c.candidateBase.Close()
 //	if c.onClose != nil {
 //		err = c.onClose()
 //		c.onClose = nil

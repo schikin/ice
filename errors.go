@@ -34,7 +34,7 @@ var (
 	ErrCanceledByCaller = errors.New("connecting canceled by caller")
 
 	// ErrMultipleStart indicates agent was started twice
-	ErrMultipleStart = errors.New("attempted to start agent twice")
+	ErrMultipleStart = errors.New("attempted to Bind agent twice")
 
 	// ErrRemoteUfragEmpty indicates agent was started with an empty remote ufrag
 	ErrRemoteUfragEmpty = errors.New("remote ufrag is empty")

@@ -16,21 +16,21 @@ const (
 )
 
 type ResolvableAddress struct {
-	Host string
-	Port uint32
+	Host    string
+	Port    uint32
 	Network string
 }
 
 type Candidate struct {
-	Foundation string
-	ComponentId uint16
-	Transport string
+	Foundation    string
+	ComponentId   uint16
+	Transport     string
 	TransportHost string
 	TransportPort int
-	Priority uint32
-	Type CandidateType
-	RelatedHost string
-	RelatedPort int
+	Priority      uint32
+	Type          CandidateType
+	RelatedHost   string
+	RelatedPort   int
 }
 
 func (c *Candidate) String() string {
@@ -42,13 +42,13 @@ func (c *Candidate) String() string {
 }
 
 func (c *Candidate) isMDNS() bool {
-	return strings.HasSuffix(c.TransportHost, ".local");
+	return strings.HasSuffix(c.TransportHost, ".local")
 }
 
 type LocalCandidate struct {
 	Candidate
 
-	base Base
+	base base
 }
 
 // Candidate represents an ICE candidate
@@ -69,8 +69,8 @@ type LocalCandidate struct {
 //
 //	addr() *net.UDPAddr
 //
-//	close() error
+//	Close() error
 //	seen(outbound bool)
-//	start(conn net.PacketConn)
+//	Bind(conn net.PacketConn)
 //	writeTo(raw []byte, dst Candidate) (int, error)
 //}

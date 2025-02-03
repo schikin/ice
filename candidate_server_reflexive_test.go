@@ -1,4 +1,5 @@
 package ice
+
 //
 //import (
 //	"testing"
@@ -32,7 +33,7 @@ package ice
 //		t.Fatal(err)
 //	}
 //
-//	err = server.Start()
+//	err = server.Bind()
 //	if err != nil {
 //		t.Fatal(err)
 //	}

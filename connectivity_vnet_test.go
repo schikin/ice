@@ -98,7 +98,7 @@ func buildVNet(natType *vnet.NATType) (*virtualNet, error) {
 		return nil, err
 	}
 
-	// Start routers
+	// Bind routers
 	err = wan.Start()
 	if err != nil {
 		return nil, err
@@ -135,6 +135,7 @@ func buildVNet(natType *vnet.NATType) (*virtualNet, error) {
 		server: server,
 	}, nil
 }
+
 //
 //func connectWithVNet(aAgent, bAgent *Agent) (*Conn, *Conn) {
 //	loggerFactory := logging.NewDefaultLoggerFactory()
@@ -165,7 +166,7 @@ func buildVNet(natType *vnet.NATType) (*virtualNet, error) {
 //		var acceptErr error
 //		aConn, acceptErr = aAgent.AcceptSession(context.TODO(), bUfrag, bPwd)
 //		check(acceptErr)
-//		close(accepted)
+//		Close(accepted)
 //	}()
 //
 //	bConn, err := bAgent.Dial(context.TODO(), aUfrag, aPwd)
@@ -291,7 +292,7 @@ func buildVNet(natType *vnet.NATType) (*virtualNet, error) {
 //		if !assert.NoError(t, err, "should succeed") {
 //			return
 //		}
-//		defer v.close()
+//		defer v.Close()
 //
 //		log.Debug("Connecting...")
 //		urls0 := []*URL{
@@ -324,7 +325,7 @@ func buildVNet(natType *vnet.NATType) (*virtualNet, error) {
 //		if !assert.NoError(t, err, "should succeed") {
 //			return
 //		}
-//		defer v.close()
+//		defer v.Close()
 //
 //		log.Debug("Connecting...")
 //		urls0 := []*URL{

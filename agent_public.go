@@ -57,18 +57,17 @@ type AgentConfig struct {
 
 	TrickleMode *TrickleMode
 
-	Standard *ICEStandard
+	Standard *Standard
 
 	STUNConfig *STUNConfig
 	TURNConfig *TURNConfig
 
 	Pacing *int
-	Mode *ICEMode
+	Mode   *Mode
 }
 
-
 // NewAgent creates a new Agent
-func NewAgent(config AgentConfig, signalChannel SignalChannel) (*Agent, error) {
+func NewAgent(config AgentConfig, signalChannel SignalHandler) (*Agent, error) {
 	loggerFactory := config.LoggerFactory
 	if loggerFactory == nil {
 		loggerFactory = logging.NewDefaultLoggerFactory()
@@ -94,38 +93,38 @@ func NewAgent(config AgentConfig, signalChannel SignalChannel) (*Agent, error) {
 	}
 
 	a := &Agent{
-		Config: 				config,
-		Streams: 				make(map[string]*Stream),
-		streamsOrdered:			make(map[int]*Stream),
-		streamsLoopCounter:     0,
+		Config:             config,
+		Streams:            make(map[string]*Stream),
+		streamsOrdered:     make(map[int]*Stream),
+		streamsLoopCounter: 0,
 
-		events:           		make(EventChannel),
+		events: make(EventChannel),
 
-		tieBreaker:             rand.New(rand.NewSource(time.Now().UnixNano())).Uint64(),
+		tieBreaker: rand.New(rand.NewSource(time.Now().UnixNano())).Uint64(),
 
-		networkTypes:           config.NetworkTypes,
-		mDNS: 					mDNS,
+		networkTypes: config.NetworkTypes,
+		mDNS:         mDNS,
 
-		localCredentials:		Credentials{
+		localCredentials: Credentials{
 			UFrag: randSeq(16),
 			Pwd:   randSeq(32),
 		},
 
-		foundationGenerator: 	newFoundationGenerator(),
+		foundationGenerator: newFoundationGenerator(),
 
-		signalChannel:			signalChannel,
-		connResultChannel:      make(chan interface{}, 1),
+		signalHandler:     signalChannel,
+		connResultChannel: make(chan interface{}, 1),
 
-		localGatherState:	 	GatheringStateNew,
-		remoteGatherState:	 	GatheringStateNew,
+		localGatherState:  GatheringStateNew,
+		remoteGatherState: GatheringStateNew,
 
-		localSignalQueue:		newSignalQueue(),
-		remoteSignalQueue:		newSignalQueue(),
+		localSignalQueue:  newTrickleQueue(),
+		remoteSignalQueue: newTrickleQueue(),
 
-		loggerFactory: 			loggerFactory,
-		log:           			log,
+		loggerFactory: loggerFactory,
+		log:           log,
 
-		mux:					sync.Mutex{},
+		mux: sync.Mutex{},
 	}
 
 	a.stunPacer = newStunPacer(a, pacing)
@@ -187,13 +186,13 @@ func (a *Agent) Dial(request LocalSessionRequest) error {
 
 	a.startLocalOffer()
 
-	localOfferSig := <- a.localSignalQueue.offer
+	localOfferSig := <-a.localSignalQueue.offer
 
 	if localOfferSig == nil {
 		return fmt.Errorf("failed to get local proposal - no offer has been emitted")
 	}
 
-	err := a.signalChannel.SendDescription(*localOfferSig)
+	err := a.signalHandler.HandleDescription(*localOfferSig)
 
 	if err != nil {
 		return fmt.Errorf("failed to send proposal to peer over signal channel: %v", err)
@@ -204,7 +203,7 @@ func (a *Agent) Dial(request LocalSessionRequest) error {
 	go a.flushRemoteQueue()
 	a.mux.Unlock()
 
-	res := <- a.connResultChannel
+	res := <-a.connResultChannel
 
 	switch typedRes := res.(type) {
 	case error:
@@ -220,11 +219,11 @@ func (a *Agent) AcceptSession(request RemoteSessionRequest) (*RemoteSessionReque
 
 	a.remoteCredentials = request.SessionCredentials
 
-	if peerIce2 && a.localStandard != ICEStandardRFC8445 {
+	if peerIce2 && a.localStandard != StandardRFC8445 {
 		return nil, fmt.Errorf("remote peer requested RFC8445 session but local configuration forces RFC5245")
 	}
 
-	var mode ICEMode
+	var mode Mode
 
 	if request.Options.Mode != nil {
 		mode = *request.Options.Mode
@@ -236,20 +235,20 @@ func (a *Agent) AcceptSession(request RemoteSessionRequest) (*RemoteSessionReque
 		a.log.Debugf("remote peer didn't specify ICE mode - assuming full")
 	}
 
-	sessionLevel := SessionParameters {
-		Pacing: &pacing,
-		Mode: &mode,
-		Options: []ICEOption{},
+	sessionLevel := SessionParameters{
+		Pacing:  &pacing,
+		Mode:    &mode,
+		Options: []Option{},
 	}
 
-	if a.localStandard == ICEStandardRFC8445 {
+	if a.localStandard == StandardRFC8445 {
 		sessionLevel.Options = append(sessionLevel.Options, ICEOptionICE2)
 	}
 
 	ret := &RemoteSessionRequest{
-		Options:		 sessionLevel,
+		Options:            sessionLevel,
 		SessionCredentials: &a.localCredentials,
-		Streams:         []RemoteStreamRequest{},
+		Streams:            []SignalStreamRequest{},
 	}
 
 	for _, strReq := range request.Streams {

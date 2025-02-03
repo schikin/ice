@@ -8,7 +8,7 @@ import "github.com/pion/logging"
 
 //https://tools.ietf.org/html/rfc8445#section-4
 
-type Event interface {}
+type Event interface{}
 type EventChannel chan Event
 
 type streamEvent struct {
@@ -20,31 +20,31 @@ type streamSignalFinished struct {
 }
 
 type Stream struct {
-	ID					string
-	Agent	    		*Agent
+	ID    string
+	Agent *Agent
 
-	Components 			map[uint16]*Component
+	Components map[uint16]*Component
 
-	localCredentials  	*Credentials
-	remoteCredentials 	*Credentials
+	localCredentials  *Credentials
+	remoteCredentials *Credentials
 
-	localTrickleMode 	TrickleMode
-	remoteTrickleMode 	TrickleMode
+	localTrickleMode  TrickleMode
+	remoteTrickleMode TrickleMode
 
-	localTrickleState 	TrickleState
-	remoteTrickleState	TrickleState
-	trickleStateIdx   	map[uint16]*trickleStrategy
+	localTrickleState  TrickleState
+	remoteTrickleState TrickleState
+	trickleStateIdx    map[uint16]*trickleStrategy
 
-	connectionState		ConnectionState
-	gatheringState 		GatheringState
+	connectionState ConnectionState
+	gatheringState  GatheringState
 
-	checklist	   		*checklist
+	checklist *checklist
 
-	log           		logging.LeveledLogger
-	mux			  		sync.Mutex
+	log logging.LeveledLogger
+	mux sync.Mutex
 }
 
-func (s *Stream) acceptResponse(sessionRes RemoteSessionRequest, streamRes RemoteStreamRequest) error {
+func (s *Stream) acceptResponse(sessionRes RemoteSessionRequest, streamRes SignalStreamRequest) error {
 	s.mux.Lock()
 	defer s.mux.Unlock()
 
@@ -82,15 +82,15 @@ func (s *Stream) acceptResponse(sessionRes RemoteSessionRequest, streamRes Remot
 		}
 	}
 
-	s.Agent.dispatchEvent(streamSignalFinished{stream:s})
+	s.Agent.dispatchEvent(streamSignalFinished{stream: s})
 
 	return nil
 }
 
-func (s *Stream) generateProposal() *RemoteStreamRequest {
+func (s *Stream) generateProposal() *SignalStreamRequest {
 	trickleFlag := s.localTrickleMode == TrickleModeHalf || s.localTrickleMode == TrickleModeFull
 
-	compRequests := []RemoteComponentRequest{}
+	compRequests := []SignalComponentRequest{}
 
 	for _, comp := range s.Components {
 		candidates := []Candidate{}
@@ -99,7 +99,7 @@ func (s *Stream) generateProposal() *RemoteStreamRequest {
 			candidates = append(candidates, cand.Candidate)
 		}
 
-		compRequest := RemoteComponentRequest{
+		compRequest := SignalComponentRequest{
 			ID:               comp.ID,
 			Candidates:       candidates,
 			RelatedComponent: nil,
@@ -108,7 +108,7 @@ func (s *Stream) generateProposal() *RemoteStreamRequest {
 		compRequests = append(compRequests, compRequest)
 	}
 
-	proposal := &RemoteStreamRequest{
+	proposal := &SignalStreamRequest{
 		ID:         s.ID,
 		Components: compRequests,
 		Trickle:    trickleFlag,
@@ -144,7 +144,6 @@ func (s *Stream) processLocalCandidate(candidate *LocalCandidate) {
 		}
 	}
 
-
 	//do pairing here also?
 	s.log.Warnf("PAIRING BEGINS")
 }
@@ -171,7 +170,7 @@ func (s *Stream) processGatherState(component *Component, state GatheringState) 
 	hasError := false
 	hasUnfinished := false
 
-	outerLoop:
+outerLoop:
 	for _, c := range s.Components {
 		switch c.gatheringState {
 		case GatheringStateNew, GatheringStateGathering:
@@ -272,7 +271,6 @@ func (s *Stream) getRemoteCredentials() *Credentials {
 	}
 }
 
-
 func (s *Stream) getLocalCredentials() *Credentials {
 	if s.localCredentials == nil {
 		return &s.Agent.localCredentials
@@ -281,7 +279,7 @@ func (s *Stream) getLocalCredentials() *Credentials {
 	}
 }
 
-func newStreamLocal(agent *Agent, request LocalStreamRequest) (*Stream, error) {
+func newStreamLocal(agent *Agent, request StreamConfiguration) (*Stream, error) {
 	trickleMode := agent.defaultTrickleMode
 
 	if request.TrickleMode != nil {
@@ -296,14 +294,14 @@ func newStreamLocal(agent *Agent, request LocalStreamRequest) (*Stream, error) {
 		remoteCredentials: nil,
 		localCredentials:  request.StreamCredentials,
 
-		trickleStateIdx:   make(map[uint16]*trickleStrategy),
-		localTrickleState: TrickleStateNew,
+		trickleStateIdx:    make(map[uint16]*trickleStrategy),
+		localTrickleState:  TrickleStateNew,
 		remoteTrickleState: TrickleStateNew,
 
 		localTrickleMode:  trickleMode,
 		remoteTrickleMode: 0,
 
-		log:               agent.log,
+		log: agent.log,
 	}
 
 	for _, compReq := range request.Components {
@@ -320,7 +318,7 @@ func newStreamLocal(agent *Agent, request LocalStreamRequest) (*Stream, error) {
 	return ret, nil
 }
 
-func newStreamRemote(agent *Agent, request RemoteStreamRequest) (*Stream, error) {
+func newStreamRemote(agent *Agent, request SignalStreamRequest) (*Stream, error) {
 	log := agent.log
 	localTrickleMode := agent.defaultTrickleMode
 	remoteTrickleMode := agent.defaultTrickleMode
@@ -337,7 +335,6 @@ func newStreamRemote(agent *Agent, request RemoteStreamRequest) (*Stream, error)
 		remoteTrickleState = TrickleStateFinished
 	}
 
-
 	ret := &Stream{
 		ID:         request.ID,
 		Agent:      agent,
@@ -346,14 +343,14 @@ func newStreamRemote(agent *Agent, request RemoteStreamRequest) (*Stream, error)
 		remoteCredentials: request.StreamCredentials,
 		localCredentials:  nil, //by default we stick with session-level credentials
 
-		trickleStateIdx:   make(map[uint16]*trickleStrategy),
-		localTrickleState: TrickleStateNew,
+		trickleStateIdx:    make(map[uint16]*trickleStrategy),
+		localTrickleState:  TrickleStateNew,
 		remoteTrickleState: remoteTrickleState,
 
 		localTrickleMode:  localTrickleMode,
 		remoteTrickleMode: remoteTrickleMode,
 
-		log:               log,
+		log: log,
 	}
 
 	for _, compReq := range request.Components {

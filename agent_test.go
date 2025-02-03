@@ -160,7 +160,7 @@ import (
 //	}
 //	callbackCalled := make(chan struct{}, 1)
 //	if err = a.OnSelectedCandidatePairChange(func(local, remote Candidate) {
-//		close(callbackCalled)
+//		Close(callbackCalled)
 //	}); err != nil {
 //		t.Fatalf("Failed to set agent OnCandidatePairChange callback: %s", err)
 //	}
@@ -380,7 +380,7 @@ import (
 //		FilteringBehavior: vnet.EndpointIndependent,
 //	})
 //	require.NoError(t, err, "should succeed")
-//	defer v.close()
+//	defer v.Close()
 //
 //	aNotifier, aConnected := onConnected()
 //	bNotifier, bConnected := onConnected()
@@ -672,13 +672,13 @@ import (
 //	err = aAgent.OnConnectionStateChange(func(c ConnectionState) {
 //		switch c {
 //		case ConnectionStateChecking:
-//			close(isChecking)
+//			Close(isChecking)
 //		case ConnectionStateConnected:
-//			close(isConnected)
+//			Close(isConnected)
 //		case ConnectionStateDisconnected:
-//			close(isDisconnected)
+//			Close(isDisconnected)
 //		case ConnectionStateClosed:
-//			close(isClosed)
+//			Close(isClosed)
 //		}
 //	})
 //	if err != nil {
@@ -716,25 +716,25 @@ import (
 //	})
 //}
 //
-func testBuildLocalComponentRequest(id uint16) LocalComponentRequest {
-	return LocalComponentRequest{
+func testBuildLocalComponentRequest(id uint16) ComponentConfiguration {
+	return ComponentConfiguration{
 		ID:               id,
 		RelatedComponent: nil,
 	}
 }
 
-func testBuildLocalStreamRequest(componentCount int, streamId string) LocalStreamRequest {
+func testBuildLocalStreamRequest(componentCount int, streamId string) StreamConfiguration {
 	if len(streamId) == 0 {
 		streamId = randSeq(10)
 	}
 
-	compReqs := []LocalComponentRequest{}
+	compReqs := []ComponentConfiguration{}
 
 	for i := 0; i < componentCount; i++ {
 		compReqs = append(compReqs, testBuildLocalComponentRequest(uint16(i)))
 	}
 
-	return LocalStreamRequest{
+	return StreamConfiguration{
 		ID:                streamId,
 		StreamCredentials: nil,
 		TrickleMode:       nil,
@@ -799,13 +799,13 @@ func TestMutualSTUN(t *testing.T) {
 	agent1, err := testBuildAgent(v.net0)
 
 	if err != nil {
-		t.Fatal(err);
+		t.Fatal(err)
 	}
 
 	agent2, err := testBuildAgent(v.net1)
 
 	if err != nil {
-		t.Fatal(err);
+		t.Fatal(err)
 	}
 
 	proposal, err := agent1.InitiateSession(buildLocalSessionRequest())
@@ -829,7 +829,7 @@ func TestMutualSTUN(t *testing.T) {
 
 func buildLocalSessionRequest() LocalSessionRequest {
 	streamCount := 2
-	streamRequests := []LocalStreamRequest{}
+	streamRequests := []StreamConfiguration{}
 
 	for i := 0; i < streamCount; i++ {
 		streamRequests = append(streamRequests, testBuildLocalStreamRequest(2, ""))
@@ -842,7 +842,7 @@ func TestLocalProposal(t *testing.T) {
 	agent, err := testBuildAgent(nil)
 
 	if err != nil {
-		t.Fatal(err);
+		t.Fatal(err)
 	}
 
 	_, err = agent.InitiateSession(buildLocalSessionRequest())
@@ -853,6 +853,7 @@ func TestLocalProposal(t *testing.T) {
 
 	//t.Logf("proposal: %s", proposal.NegotiateParams)
 }
+
 //}
 //
 //func TestCandidatePairStats(t *testing.T) {

@@ -57,27 +57,27 @@ func (t GatheringState) String() string {
 }
 
 type Gatherer struct {
-	Config GathererConfig
-	State GatheringState
+	Config     GathererConfig
+	State      GatheringState
 	Candidates []*LocalCandidate
 
 	NetworkTypes []NetworkType
-	Component *Component
+	Component    *Component
 
-	isHost bool
+	isHost  bool
 	isSrflx bool
 	isRelay bool
 
-	net			  *vnet.Net
-	log           logging.LeveledLogger
-	ips			  []*net.IP
+	net *vnet.Net
+	log logging.LeveledLogger
+	ips []*net.IP
 
-	wg	sync.WaitGroup
+	wg  sync.WaitGroup
 	mux sync.Mutex
 }
 
 type STUNConfig struct {
-	Servers	[]*URL
+	Servers []*URL
 }
 
 type TURNConfig struct {
@@ -85,16 +85,16 @@ type TURNConfig struct {
 }
 
 type GathererConfig struct {
-	Component	*Component
+	Component *Component
 
-	VNet		*vnet.Net
-	Logger		logging.LeveledLogger
-	LoggerFactory	logging.LoggerFactory
+	VNet          *vnet.Net
+	Logger        logging.LeveledLogger
+	LoggerFactory logging.LoggerFactory
 
-	STUN	STUNConfig
-	TURN	TURNConfig
+	STUN STUNConfig
+	TURN TURNConfig
 
-	NetworkTypes []NetworkType
+	NetworkTypes   []NetworkType
 	GatheringTypes []GatheringType
 }
 
@@ -104,16 +104,16 @@ type gathererEvent struct {
 
 type gathererStateEvent struct {
 	gathererEvent
-	State	GatheringState
+	State GatheringState
 }
 
 type gathererCandidateEvent struct {
 	gathererEvent
-	Candidate	*LocalCandidate
+	Candidate *LocalCandidate
 }
 
 func (g *Gatherer) GetConfig() AgentConfig {
-	return g.Component.Stream.Agent.Config;
+	return g.Component.Stream.Agent.Config
 }
 
 func (g *Gatherer) emitCandidate(candidate *LocalCandidate) {
@@ -122,12 +122,12 @@ func (g *Gatherer) emitCandidate(candidate *LocalCandidate) {
 	g.Candidates = append(g.Candidates, candidate)
 
 	//dispatch upstream
-	g.Component.dispatchEvent(gathererCandidateEvent{gathererEvent{Gatherer:g}, candidate})
+	g.Component.dispatchEvent(gathererCandidateEvent{gathererEvent{Gatherer: g}, candidate})
 }
 
 func NewGatherer(config GathererConfig) (*Gatherer, error) {
 	if config.Logger == nil && config.LoggerFactory == nil {
-		return nil, errors.New("either logger or logger factory need to be provided");
+		return nil, errors.New("either logger or logger factory need to be provided")
 	}
 
 	if config.Logger == nil {
@@ -143,24 +143,22 @@ func NewGatherer(config GathererConfig) (*Gatherer, error) {
 	}
 
 	if config.GatheringTypes == nil || len(config.GatheringTypes) == 0 {
-		config.GatheringTypes = []GatheringType{GatheringTypeHost}; //by default host only
+		config.GatheringTypes = []GatheringType{GatheringTypeHost} //by default host only
 	}
 
-
 	ret := &Gatherer{
-		State:      GatheringStateNew,
-		Candidates: []*LocalCandidate{},
+		State:        GatheringStateNew,
+		Candidates:   []*LocalCandidate{},
 		NetworkTypes: config.NetworkTypes,
-		Component:  config.Component,
+		Component:    config.Component,
 
-		isHost: false,
+		isHost:  false,
 		isRelay: false,
 		isSrflx: false,
 
 		log: config.Logger,
 		net: config.VNet,
 		ips: []*net.IP{},
-
 	}
 
 	turnServersProvided := config.TURN.Servers != nil && len(config.TURN.Servers) != 0
@@ -209,7 +207,7 @@ func NewGatherer(config GathererConfig) (*Gatherer, error) {
 }
 
 func (g *Gatherer) setState(state GatheringState) {
-	g.log.Debugf("gatherer state: %s -> %s", g.State, state);
+	g.log.Debugf("gatherer state: %s -> %s", g.State, state)
 
 	g.State = state
 	g.Component.dispatchEvent(gathererStateEvent{
@@ -224,7 +222,7 @@ func calculatePriority(ctype CandidateType, lpref uint16, componentId uint16) ui
 		uint32(256-componentId)
 }
 
-func (g *Gatherer) gatherSingleSrflx(base Base, url *URL, localPreference uint16) {
+func (g *Gatherer) gatherSingleSrflx(base base, url *URL, localPreference uint16) {
 	defer g.wg.Done()
 
 	network := base.NetworkType().NetworkShort()
@@ -250,7 +248,7 @@ func (g *Gatherer) gatherSingleSrflx(base Base, url *URL, localPreference uint16
 		The agent SHOULD NOT generate transactions more frequently than once
 		per each ta expiration.  See Section 14 for guidance on how to set Ta
 		and the STUN retransmit timer, RTO
-	 */
+	*/
 
 	stunAddr, err := sendGatheringBind(base, addr, stunGatherTimeout)
 
@@ -309,7 +307,7 @@ func (g *Gatherer) gatherSingleHost(network string, ip *net.IP, localPreference 
 
 	mdns := g.Component.Stream.Agent.mDNS
 
-	base, err := CreateBase(network, ip, g.Component)
+	base, err := createBase(network, ip, g.Component)
 
 	if err != nil {
 		g.log.Errorf("could not create base: %v", err)
@@ -433,7 +431,7 @@ func (g *Gatherer) gatherRelaySingle(hostCandidate *LocalCandidate, url *URL) er
 	//	return err
 	//}
 	//
-	//candidate.start(relayConn)
+	//candidate.Bind(relayConn)
 	//g.emitCandidate(candidate)
 }
 
@@ -445,7 +443,7 @@ func (g *Gatherer) gatherRelay(hostCandidate *LocalCandidate) {
 
 //TODO: error handling
 func (g *Gatherer) Start() {
-	g.log.Debugf("starting ICE candidates gathering");
+	g.log.Debugf("starting ICE candidates gathering")
 
 	g.setState(GatheringStateGathering)
 	g.readLocalInterfaces()
@@ -513,7 +511,7 @@ func (g *Gatherer) readLocalInterfaces() {
 	}
 
 	g.mux.Lock()
-	defer g.mux.Unlock();
+	defer g.mux.Unlock()
 
-	g.ips = ips;
+	g.ips = ips
 }

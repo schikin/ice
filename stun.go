@@ -62,14 +62,14 @@ func (c TrxState) String() string {
 
 //TODO: RTO
 type STUNTransaction struct {
-	Message *stun.Message
-	Base Base
-	Target net.Addr
-	Timeout time.Duration
-	RTO time.Duration
+	Message  *stun.Message
+	Base     base
+	Target   net.Addr
+	Timeout  time.Duration
+	RTO      time.Duration
 	StringId string
 
-	softFail	  bool
+	softFail      bool
 	state         TrxState
 	pacer         *stunPacer
 	mux           sync.Mutex
@@ -92,20 +92,20 @@ func stunEncodeTrxId(data [stun.TransactionIDSize]byte) string {
 
      Num-Of-Cands: the number of server-reflexive and relay candidates
 
- */
-func newStunTransactionGathering(base Base, message *stun.Message, target net.Addr) (*STUNTransaction, error) {
+*/
+func newStunTransactionGathering(base base, message *stun.Message, target net.Addr) (*STUNTransaction, error) {
 	rto := 500 * time.Millisecond //TODO: proper RTO calculation to be done later
 
 	return newStunTransaction(base, message, target, rto)
 }
 
-func newStunTransactionCheck(base Base, message *stun.Message, target net.Addr) (*STUNTransaction, error) {
+func newStunTransactionCheck(base base, message *stun.Message, target net.Addr) (*STUNTransaction, error) {
 	rto := 500 * time.Millisecond //just set at 500 - it's a bit more aggressive but spec allows it
 
 	return newStunTransaction(base, message, target, rto)
 }
 
-func newStunTransaction(base Base, message *stun.Message, target net.Addr, RTO time.Duration) (*STUNTransaction, error) {
+func newStunTransaction(base base, message *stun.Message, target net.Addr, RTO time.Duration) (*STUNTransaction, error) {
 	trx := &STUNTransaction{
 		Message:  message,
 		Base:     base,
@@ -149,7 +149,6 @@ func (trx *STUNTransaction) GetState() TrxState {
 
 	return trx.state
 }
-
 
 func (trx *STUNTransaction) waitForResult() (*stun.Message, error) {
 	timeout := trx.Timeout
@@ -209,7 +208,7 @@ func (trx *STUNTransaction) ExecutePacedSync() (*stun.Message, error) {
 func (trx *STUNTransaction) ExecutePacedAsync(handler func(*stun.Message, error)) {
 	go func() {
 		msg, err := trx.ExecutePacedSync()
-		handler(msg,err)
+		handler(msg, err)
 	}()
 }
 
@@ -228,7 +227,7 @@ func (trx *STUNTransaction) transmit() {
 	a := trx.Base.Component().Stream.Agent
 
 	a.log.Debugf("sending STUN trxId=%s %s:%d->%s", trx.StringId, trx.Base.Address(), trx.Base.Port(), trx.Target)
-	_, err := trx.Base.write(trx.Message.Raw, trx.Target)
+	_, err := trx.Base.Write(trx.Message.Raw, trx.Target)
 
 	if err != nil {
 		a.log.Debugf("IO failed for STUN trxId=%s: %v", trx.StringId, err)
@@ -247,7 +246,7 @@ func (trx *STUNTransaction) transmit() {
 func (trx *STUNTransaction) ExecuteImmediatelyAsync(handler func(*stun.Message, error)) {
 	go func() {
 		msg, err := trx.ExecuteImmediatelySync()
-		handler(msg,err)
+		handler(msg, err)
 	}()
 }
 
@@ -257,7 +256,7 @@ func (trx *STUNTransaction) cancel() {
 	trx.Base.Component().Stream.Agent.stunPacer.trxCancel(strId)
 }
 
-func sendGatheringBind(base Base, serverAddr net.Addr) (*stun.XORMappedAddress, error) {
+func sendGatheringBind(base base, serverAddr net.Addr) (*stun.XORMappedAddress, error) {
 	//stun.TransactionID is a default setter that will generate the random trx id for us
 	req, err := stun.Build(stun.BindingRequest, stun.TransactionID)
 
@@ -282,4 +281,21 @@ func sendGatheringBind(base Base, serverAddr net.Addr) (*stun.XORMappedAddress, 
 		return nil, fmt.Errorf("failed to get XOR-MAPPED-ADDRESS response: %v", err)
 	}
 	return &addr, nil
+}
+
+func demultiplexSTUN(buffer []byte) (*stun.Message, error) {
+	if stun.IsMessage(buffer) {
+		m := &stun.Message{
+			Raw: make([]byte, len(buffer)),
+		}
+		// Explicitly copy raw buffer so Response can own the memory.
+		copy(m.Raw, buffer)
+		if err := m.Decode(); err != nil {
+			return nil, err
+		}
+
+		return m, nil
+	}
+
+	return nil, nil
 }

@@ -1,4 +1,5 @@
 package ice
+
 //
 //import (
 //	"context"
@@ -74,7 +75,7 @@ package ice
 //	}
 //
 //	if stun.IsMessage(p) {
-//		return 0, errors.New("the ICE conn can't write STUN messages")
+//		return 0, errors.New("the ICE conn can't Write STUN messages")
 //	}
 //
 //	pair, err := c.agent.getSelectedPair()
@@ -85,7 +86,7 @@ package ice
 //	return pair.Write(p)
 //}
 //
-//// Close implements the Conn Close method. It is used to close
+//// Close implements the Conn Close method. It is used to Close
 //// the connection. Any calls to Read and Write will be unblocked and return an error.
 //func (c *Conn) Close() error {
 //	return c.agent.Close()

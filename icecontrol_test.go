@@ -74,13 +74,13 @@ func TestControl_GetFrom(t *testing.T) {
 			t.Error("unexpected error")
 		}
 	})
-	t.Run("Controlling", func(t *testing.T) {
+	t.Run("RoleControlling", func(t *testing.T) {
 		m := new(stun.Message)
 		var c AttrControl
 		if err := c.GetFrom(m); err != stun.ErrAttributeNotFound {
 			t.Error("unexpected error")
 		}
-		c.Role = Controlling
+		c.Role = RoleControlling
 		c.Tiebreaker = 4321
 		if err := m.Build(stun.BindingRequest, &c); err != nil {
 			t.Error(err)
@@ -105,13 +105,13 @@ func TestControl_GetFrom(t *testing.T) {
 			}
 		})
 	})
-	t.Run("Controlled", func(t *testing.T) {
+	t.Run("RoleControlled", func(t *testing.T) {
 		m := new(stun.Message)
 		var c AttrControl
 		if err := c.GetFrom(m); err != stun.ErrAttributeNotFound {
 			t.Error("unexpected error")
 		}
-		c.Role = Controlled
+		c.Role = RoleControlled
 		c.Tiebreaker = 1234
 		if err := m.Build(stun.BindingRequest, &c); err != nil {
 			t.Error(err)

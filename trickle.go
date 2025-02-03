@@ -1,6 +1,7 @@
 package ice
 
-//Implements ICE trickling as per https://tools.ietf.org/html/draft-ietf-ice-trickle-21
+//Implements ICE trickling as per https://datatracker.ietf.org/doc/rfc8838/
+//NOTE: Trickle mode is a negotiable parameter - it _can_ change during the ICE negotiation. everything here needs to be built with that in mind
 
 type TrickleMode int
 
@@ -92,11 +93,11 @@ func (m SignalState) String() string {
 }
 
 type trickleStrategy struct {
-	requireHost bool
+	requireHost  bool
 	requireSrflx bool
 	requireRelay bool
 
-	hasHost bool
+	hasHost  bool
 	hasSrflx bool
 	hasRelay bool
 
@@ -152,6 +153,3 @@ func newTrickleStrategy(requiredTypes []GatheringType) *trickleStrategy {
 
 	return ret
 }
-
-
-//NOTE: Trickle mode is a negotiatable parameter - it _can_ change during the ICE negotiation. everything here needs to be built with that in mind

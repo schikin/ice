@@ -1,4 +1,5 @@
 package ice
+
 //
 //import (
 //	"fmt"
@@ -63,7 +64,7 @@ package ice
 //			a.selector = &controlledSelector{agent: a, log: a.log}
 //		}
 //
-//		a.selector.Start()
+//		a.selector.Bind()
 //
 //		agent.updateConnectionState(ConnectionStateChecking)
 //
@@ -102,7 +103,7 @@ package ice
 //	a.closeMulticastConn()
 //
 //	// Signal connected
-//	a.onConnectedOnce.Do(func() { close(a.onConnected) })
+//	a.onConnectedOnce.Do(func() { Close(a.onConnected) })
 //}
 //
 //func (a *Agent) pingAllCandidates() {
@@ -379,32 +380,32 @@ package ice
 //	done := make(chan struct{})
 //	err := a.run(func(agent *Agent) {
 //		defer func() {
-//			close(done)
+//			Close(done)
 //		}()
 //		agent.err.Store(ErrClosed)
-//		close(agent.done)
+//		Close(agent.done)
 //
 //		// Cleanup all candidates
 //		for net, cs := range agent.localCandidates {
 //			for _, c := range cs {
-//				err := c.close()
+//				err := c.Close()
 //				if err != nil {
-//					a.log.Warnf("Failed to close candidate %s: %v", c, err)
+//					a.log.Warnf("Failed to Close candidate %s: %v", c, err)
 //				}
 //			}
 //			delete(agent.localCandidates, net)
 //		}
 //		for net, cs := range agent.remoteCandidates {
 //			for _, c := range cs {
-//				err := c.close()
+//				err := c.Close()
 //				if err != nil {
-//					a.log.Warnf("Failed to close candidate %s: %v", c, err)
+//					a.log.Warnf("Failed to Close candidate %s: %v", c, err)
 //				}
 //			}
 //			delete(agent.remoteCandidates, net)
 //		}
 //		if err := a.buffer.Close(); err != nil {
-//			a.log.Warnf("failed to close buffer: %v", err)
+//			a.log.Warnf("failed to Close buffer: %v", err)
 //		}
 //
 //		if a.connectivityTicker != nil {
@@ -575,7 +576,7 @@ package ice
 //func (a *Agent) closeMulticastConn() {
 //	if a.mDNSConn != nil {
 //		if err := a.mDNSConn.Close(); err != nil {
-//			a.log.Warnf("failed to close mDNS Conn: %v", err)
+//			a.log.Warnf("failed to Close mDNS Conn: %v", err)
 //		}
 //	}
 //}
@@ -689,5 +690,3 @@ package ice
 //
 //type
 //
-
-
